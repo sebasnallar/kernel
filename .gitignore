@@ -1,0 +1,23 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Binary outputs
+*.bin
+*.elf
+*.o
+*.img
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Debug files
+*.dSYM/
