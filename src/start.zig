@@ -14,6 +14,7 @@ pub const scheduler = @import("kernel/scheduler.zig");
 pub const ipc = @import("kernel/ipc.zig");
 pub const interrupt = @import("kernel/interrupt.zig");
 pub const syscall = @import("kernel/syscall.zig");
+pub const user_program = @import("kernel/user_program.zig");
 
 // Libraries
 pub const console = @import("lib/console.zig");

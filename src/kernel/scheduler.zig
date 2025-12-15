@@ -10,6 +10,7 @@
 const root = @import("root");
 const context = root.context;
 const memory = root.memory;
+const mmu = root.mmu;
 
 // ============================================================
 // Types
@@ -95,8 +96,8 @@ pub const Process = struct {
     name: [32]u8,
     name_len: u8,
 
-    // Memory space
-    page_table_root: u64,
+    // Virtual memory address space
+    address_space: mmu.AddressSpace,
 
     // Thread list
     thread_count: u32,
@@ -139,7 +140,7 @@ var processes: [MAX_PROCESSES]Process = [_]Process{Process{
     .pid = 0,
     .name = [_]u8{0} ** 32,
     .name_len = 0,
-    .page_table_root = 0,
+    .address_space = .{ .root = 0, .asid = 0 },
     .thread_count = 0,
     .parent_pid = null,
 }} ** MAX_PROCESSES;
@@ -163,6 +164,9 @@ var initialized: bool = false;
 
 /// Reschedule pending (set in IRQ, checked on return from interrupt)
 var need_reschedule: bool = false;
+
+/// Whether kernel code has been remapped for userspace access
+var kernel_code_user_accessible: bool = false;
 
 // ============================================================
 // Initialization
@@ -271,6 +275,35 @@ pub fn createKernelThread(entry: *const fn () void, priority: Priority) ?*Thread
     return thread;
 }
 
+/// Make kernel code region accessible to userspace (for embedded test threads)
+/// This is a one-time operation that remaps the first 1MB of kernel memory
+/// to allow EL0 access. Only needed because test threads are in the kernel binary.
+fn makeKernelCodeUserAccessible() void {
+    if (kernel_code_user_accessible) return; // Already done
+
+    const boot = @import("root").boot;
+    var code_addr: u64 = boot.MEMORY_BASE;
+    const code_end = boot.MEMORY_BASE + 1 * 1024 * 1024; // First 1MB
+    var count: u32 = 0;
+
+    console.puts("  Remapping kernel code for user access");
+
+    while (code_addr < code_end) : (code_addr += memory.PAGE_SIZE) {
+        if (!mmu.mapKernelPageRaw(code_addr, code_addr, mmu.PTE.SHARED_RWX)) {
+            console.puts(" FAILED\n");
+            return;
+        }
+        count += 1;
+        if (count % 64 == 0) {
+            console.putc('.');
+        }
+    }
+    console.newline();
+
+    mmu.invalidateTlbAll();
+    kernel_code_user_accessible = true;
+}
+
 /// Create a new user thread (runs in EL0 - restricted userspace)
 /// Entry function runs with limited privileges - must use syscalls for kernel services
 pub fn createUserThread(entry: *const fn () void, priority: Priority) ?*Thread {
@@ -284,6 +317,24 @@ pub fn createUserThread(entry: *const fn () void, priority: Priority) ?*Thread {
         return null;
     };
     const user_stack_top = user_stack_base + KERNEL_STACK_SIZE;
+
+    // Map user stack pages with SHARED_RWX permissions (allows both EL0 and EL1 access)
+    if (mmu.isInitialized()) {
+        var addr: u64 = user_stack_base;
+        while (addr < user_stack_top) : (addr += memory.PAGE_SIZE) {
+            if (!mmu.mapKernelPageRaw(addr, addr, mmu.PTE.SHARED_RWX)) {
+                memory.freePages(user_stack_base, stack_pages);
+                freeThread(thread);
+                return null;
+            }
+        }
+        // Invalidate TLB for new stack mappings
+        mmu.invalidateTlbAll();
+
+        // Make kernel code region user-accessible (only done once)
+        // TODO: This causes issues - skipping for now
+        // makeKernelCodeUserAccessible();
+    }
 
     // Allocate KERNEL stack (for handling syscalls/exceptions)
     const kernel_stack_base = memory.allocContiguous(stack_pages) orelse {
@@ -413,6 +464,15 @@ fn switchTo(thread: *Thread) void {
     const old = current;
     current = thread;
     thread.state = .running;
+
+    // Handle address space switching for user threads
+    if (thread.is_user and thread.process != null) {
+        // Switch to the new process's address space
+        switchToProcessAddressSpace(thread.process.?);
+    } else if (old != null and old.?.is_user and old.?.process != null) {
+        // Switching from user to kernel thread - restore kernel address space
+        switchToKernelAddressSpace();
+    }
 
     if (old) |o| {
         if (thread.first_run) {
@@ -549,4 +609,189 @@ pub fn getThreadCount() u32 {
         if (used) count += 1;
     }
     return count;
+}
+
+// ============================================================
+// Process Management (Per-Process Address Spaces)
+// ============================================================
+
+const user_program = root.user_program;
+
+/// Allocate a process slot
+fn allocProcess() ?*Process {
+    for (&processes, 0..) |*p, i| {
+        if (!process_used[i]) {
+            process_used[i] = true;
+            return p;
+        }
+    }
+    return null;
+}
+
+/// Free a process slot
+fn freeProcess(proc: *Process) void {
+    const idx = (@intFromPtr(proc) - @intFromPtr(&processes)) / @sizeOf(Process);
+    if (idx < MAX_PROCESSES) {
+        process_used[idx] = false;
+    }
+}
+
+/// Create a new user process with its own address space
+/// code: machine code to copy into user space
+/// code_len: length of code in bytes
+/// Returns the main thread of the process
+pub fn createUserProcess(code: []const u8, priority: Priority) ?*Thread {
+    const boot = root.boot;
+
+    // Step 1: Allocate process structure
+    const proc = allocProcess() orelse return null;
+
+    // Step 2: Create address space for the process
+    const addr_space = mmu.AddressSpace.create() orelse {
+        freeProcess(proc);
+        return null;
+    };
+
+    // Step 2.5: Map kernel code/data in user address space (kernel-only permissions)
+    // This is necessary because TTBR0 is used for all low addresses, including kernel
+    // The kernel is identity-mapped at 0x40000000
+    var addr_space_init = addr_space;
+    var kaddr: u64 = boot.MEMORY_BASE;
+    const kend = boot.MEMORY_BASE + 4 * 1024 * 1024; // 4MB kernel region
+    while (kaddr < kend) : (kaddr += memory.PAGE_SIZE) {
+        if (!addr_space_init.mapRaw(kaddr, kaddr, mmu.PTE.KERNEL_RWX)) {
+            freeProcess(proc);
+            return null;
+        }
+    }
+    // Also map device memory (UART, GIC)
+    _ = addr_space_init.mapRaw(boot.UART_BASE, boot.UART_BASE, mmu.PTE.DEVICE_RW);
+    _ = addr_space_init.mapRaw(boot.GIC_DIST_BASE, boot.GIC_DIST_BASE, mmu.PTE.DEVICE_RW);
+    _ = addr_space_init.mapRaw(boot.GIC_CPU_BASE, boot.GIC_CPU_BASE, mmu.PTE.DEVICE_RW);
+
+    // Step 3: Allocate physical pages for user code
+    const code_pages = (code.len + memory.PAGE_SIZE - 1) / memory.PAGE_SIZE;
+    const code_pages_count = if (code_pages == 0) 1 else code_pages;
+    const code_phys = memory.allocContiguousRaw(code_pages_count);
+    if (code_phys == 0) {
+        freeProcess(proc);
+        return null;
+    }
+
+    // Step 4: Copy code to physical memory
+    const code_ptr: [*]u8 = @ptrFromInt(code_phys);
+    for (code, 0..) |byte, i| {
+        code_ptr[i] = byte;
+    }
+
+    // Step 5: Map code in user address space at USER_CODE_BASE
+    if (!addr_space_init.mapRangeRaw(
+        user_program.USER_CODE_BASE,
+        code_phys,
+        code_pages_count * memory.PAGE_SIZE,
+        mmu.PTE.USER_RWX,
+    )) {
+        memory.freePages(code_phys, code_pages_count);
+        freeProcess(proc);
+        return null;
+    }
+
+    // Step 6: Allocate and map user stack
+    const stack_pages = user_program.USER_STACK_SIZE / memory.PAGE_SIZE;
+    const stack_phys = memory.allocContiguousRaw(stack_pages);
+    if (stack_phys == 0) {
+        memory.freePages(code_phys, code_pages_count);
+        freeProcess(proc);
+        return null;
+    }
+
+    // Map stack at USER_STACK_BASE - USER_STACK_SIZE (stack grows down)
+    const stack_virt_base = user_program.USER_STACK_BASE - user_program.USER_STACK_SIZE;
+    if (!addr_space_init.mapRangeRaw(
+        stack_virt_base,
+        stack_phys,
+        user_program.USER_STACK_SIZE,
+        mmu.PTE.USER_RW,
+    )) {
+        memory.freePages(stack_phys, stack_pages);
+        memory.freePages(code_phys, code_pages_count);
+        freeProcess(proc);
+        return null;
+    }
+
+    // Step 7: Initialize process structure
+    proc.pid = next_pid;
+    proc.name = [_]u8{0} ** 32;
+    proc.name_len = 0;
+    proc.address_space = addr_space_init;
+    proc.thread_count = 0;
+    proc.parent_pid = null;
+    next_pid += 1;
+
+    // Step 8: Create the main thread for this process
+    const thread = allocThread() orelse {
+        memory.freePages(stack_phys, stack_pages);
+        memory.freePages(code_phys, code_pages_count);
+        freeProcess(proc);
+        return null;
+    };
+
+    // Allocate kernel stack (for syscall/exception handling)
+    const kernel_stack_pages = KERNEL_STACK_SIZE / memory.PAGE_SIZE;
+    const kernel_stack_base = memory.allocContiguous(kernel_stack_pages) orelse {
+        freeThread(thread);
+        memory.freePages(stack_phys, stack_pages);
+        memory.freePages(code_phys, code_pages_count);
+        freeProcess(proc);
+        return null;
+    };
+    const kernel_stack_top = kernel_stack_base + KERNEL_STACK_SIZE;
+
+    // Initialize thread fields
+    thread.tid = next_tid;
+    thread.state = .ready;
+    thread.priority = priority;
+    thread.time_slice = getTimeSlice(priority);
+    thread.total_runtime = 0;
+    thread.stack_base = stack_phys; // Physical address of user stack
+    thread.stack_size = @intCast(user_program.USER_STACK_SIZE);
+    thread.next = null;
+    thread.prev = null;
+    thread.process = proc;
+    thread.first_run = true;
+    thread.is_user = true;
+    thread.user_sp = user_program.USER_STACK_BASE; // Virtual user stack top
+    thread.kernel_sp = kernel_stack_top;
+
+    // Initialize CPU context
+    context.initUserContext(
+        &thread.context,
+        user_program.USER_CODE_BASE, // Entry point in user VA
+        kernel_stack_top,
+        user_program.USER_STACK_BASE,
+    );
+
+    next_tid += 1;
+    proc.thread_count = 1;
+
+    // Add to ready queue
+    enqueue(thread);
+
+    return thread;
+}
+
+/// Switch to a user process's address space
+/// Called before context switching to a user thread
+pub fn switchToProcessAddressSpace(proc: *const Process) void {
+    if (!mmu.isInitialized()) return;
+    mmu.switchAddressSpace(&proc.address_space);
+}
+
+/// Switch back to kernel address space (no user mappings)
+/// Called after context switching away from a user thread
+pub fn switchToKernelAddressSpace() void {
+    if (!mmu.isInitialized()) return;
+    // Set TTBR0 to kernel page table (identity mapping)
+    mmu.writeTtbr0(mmu.getKernelRoot());
+    asm volatile ("isb");
 }

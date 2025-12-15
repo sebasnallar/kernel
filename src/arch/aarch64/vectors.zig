@@ -277,14 +277,52 @@ fn getExceptionClass(esr: u64) u6 {
     return @truncate((esr >> 26) & 0x3F);
 }
 
+/// Handle EL1 (kernel mode) page fault - this is usually fatal
+fn handleKernelPageFault(frame: *syscall.SyscallFrame, esr: u64, is_instruction: bool) void {
+    const far = readFar();
+    const dfsc = esr & 0x3F;
+
+    console.puts(console.Color.red);
+    console.puts("\n!!! KERNEL PAGE FAULT !!!\n");
+    if (is_instruction) {
+        console.puts("  Type: Instruction abort\n");
+    } else {
+        console.puts("  Type: Data abort\n");
+    }
+    console.puts("  Faulting address: ");
+    console.putHex(far);
+    console.newline();
+    console.puts("  PC at fault:      ");
+    console.putHex(frame.elr);
+    console.newline();
+    console.puts("  Fault code:       ");
+    console.putHex(dfsc);
+    console.newline();
+    console.puts(console.Color.reset);
+
+    // Kernel page faults are unrecoverable - panic
+    const kernel = root.kernel;
+    kernel.panic("Kernel page fault");
+}
+
 export fn handleSyncWrapper(frame: *syscall.SyscallFrame) callconv(.C) void {
     const esr = readEsr();
     const ec = getExceptionClass(esr);
 
     switch (ec) {
         ExceptionClass.SVC_AARCH64 => syscall.dispatch(frame),
+        ExceptionClass.DATA_ABORT_SAME => handleKernelPageFault(frame, esr, false),
+        ExceptionClass.INST_ABORT_SAME => handleKernelPageFault(frame, esr, true),
         else => {
-            // TODO: Handle page faults, undefined instructions, etc.
+            // Unknown exception in kernel mode
+            console.puts(console.Color.red);
+            console.puts("\n!!! KERNEL EXCEPTION !!!\n");
+            console.puts("  EC=");
+            console.putHex(ec);
+            console.puts(" ESR=");
+            console.putHex(esr);
+            console.newline();
+            console.puts(console.Color.reset);
         },
     }
 }
@@ -382,6 +420,75 @@ fn readFar() u64 {
     );
 }
 
+/// Handle a page fault (data or instruction abort)
+fn handlePageFault(frame: *El0Frame, esr: u64, is_instruction: bool) void {
+    const far = readFar(); // Faulting address
+    const iss = esr & 0x3F; // Instruction-specific syndrome
+    const wnr = (esr >> 6) & 1; // Write-not-read
+    const dfsc = iss & 0x3F; // Data Fault Status Code
+
+    console.puts(console.Color.red);
+    if (is_instruction) {
+        console.puts("\n[PAGE FAULT] Instruction abort\n");
+    } else {
+        console.puts("\n[PAGE FAULT] Data abort (");
+        if (wnr != 0) {
+            console.puts("write");
+        } else {
+            console.puts("read");
+        }
+        console.puts(")\n");
+    }
+
+    console.puts("  Faulting address: ");
+    console.putHex(far);
+    console.newline();
+
+    console.puts("  PC at fault:      ");
+    console.putHex(frame.elr);
+    console.newline();
+
+    console.puts("  Fault code:       ");
+    console.putHex(dfsc);
+    console.puts(" (");
+    switch (dfsc) {
+        0b000000 => console.puts("Address size fault L0"),
+        0b000001 => console.puts("Address size fault L1"),
+        0b000010 => console.puts("Address size fault L2"),
+        0b000011 => console.puts("Address size fault L3"),
+        0b000100 => console.puts("Translation fault L0"),
+        0b000101 => console.puts("Translation fault L1"),
+        0b000110 => console.puts("Translation fault L2"),
+        0b000111 => console.puts("Translation fault L3"),
+        0b001001 => console.puts("Access flag fault L1"),
+        0b001010 => console.puts("Access flag fault L2"),
+        0b001011 => console.puts("Access flag fault L3"),
+        0b001101 => console.puts("Permission fault L1"),
+        0b001110 => console.puts("Permission fault L2"),
+        0b001111 => console.puts("Permission fault L3"),
+        0b010000 => console.puts("Sync external abort"),
+        0b100001 => console.puts("Alignment fault"),
+        else => console.puts("unknown"),
+    }
+    console.puts(")\n");
+
+    // Get current thread info
+    if (scheduler.getCurrent()) |thread| {
+        console.puts("  Thread TID:       ");
+        console.putDec(thread.tid);
+        console.newline();
+    }
+
+    console.puts(console.Color.reset);
+
+    // For now, kill the faulting thread
+    if (scheduler.getCurrent()) |thread| {
+        console.puts("  Killing thread...\n");
+        thread.state = .dead;
+        scheduler.setNeedReschedule();
+    }
+}
+
 export fn handleEl0SyncWrapper(frame: *El0Frame) callconv(.C) void {
     const esr = readEsr();
     const ec = getExceptionClass(esr);
@@ -392,19 +499,32 @@ export fn handleEl0SyncWrapper(frame: *El0Frame) callconv(.C) void {
             const syscall_frame: *syscall.SyscallFrame = @ptrCast(frame);
             syscall.dispatch(syscall_frame);
         },
+        ExceptionClass.DATA_ABORT_LOWER => {
+            handlePageFault(frame, esr, false);
+        },
+        ExceptionClass.INST_ABORT_LOWER => {
+            handlePageFault(frame, esr, true);
+        },
         else => {
             // Other sync exception from userspace - report error
             console.puts(console.Color.red);
-            console.puts("[EL0] Sync EC=");
+            console.puts("\n[EL0] Unknown exception\n");
+            console.puts("  EC=");
             console.putHex(ec);
             console.puts(" ESR=");
             console.putHex(esr);
-            console.puts(" ELR=");
+            console.puts("\n  ELR=");
             console.putHex(frame.elr);
             console.puts(" FAR=");
             console.putHex(readFar());
             console.newline();
             console.puts(console.Color.reset);
+
+            // Kill the thread
+            if (scheduler.getCurrent()) |thread| {
+                thread.state = .dead;
+                scheduler.setNeedReschedule();
+            }
         },
     }
 

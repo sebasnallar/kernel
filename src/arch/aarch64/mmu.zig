@@ -90,6 +90,11 @@ pub const PTE = struct {
     pub const USER_RO: u64 = VALID | PAGE | AF | SH_INNER | ATTR_NORMAL | AP_RO_ALL | NG | PXN | UXN;
     pub const USER_RX: u64 = VALID | PAGE | AF | SH_INNER | ATTR_NORMAL | AP_RO_ALL | NG | PXN;
 
+    // Shared kernel/user code - allows both EL1 and EL0 execution
+    // Used for kernel code that embedded userspace test threads execute
+    // Note: NG bit might be required for AP_RW_ALL to work properly
+    pub const SHARED_RWX: u64 = VALID | PAGE | AF | SH_INNER | ATTR_NORMAL | AP_RW_ALL | NG;
+
     pub const TABLE_DESC: u64 = VALID | TABLE;
 };
 
@@ -230,7 +235,8 @@ pub const AddressSpace = struct {
     /// Address Space ID
     asid: u16,
 
-    pub fn init() ?AddressSpace {
+    /// Create a new address space with an empty L0 table
+    pub fn create() ?AddressSpace {
         // Use raw allocator to avoid optional return bug
         const l0_phys = memory.allocContiguousRaw(1);
         if (l0_phys == 0) return null;
@@ -245,24 +251,19 @@ pub const AddressSpace = struct {
         };
     }
 
-    pub fn deinit(self: *AddressSpace) void {
+    pub fn destroy(self: *AddressSpace) void {
         // TODO: Walk and free all page tables
         freeAsid(self.asid);
         memory.freeFrame(self.root);
     }
 
-    /// Map a virtual address to a physical address
-    pub fn map(self: *AddressSpace, virt: u64, phys: u64, flags: u64) !void {
-        try mapPage(@ptrFromInt(self.root), virt, phys, flags);
+    /// Map a virtual address to a physical address (returns false on failure)
+    pub fn mapRaw(self: *AddressSpace, virt: u64, phys: u64, flags: u64) bool {
+        return mapPageRaw(@ptrFromInt(self.root), virt, phys, flags);
     }
 
-    /// Unmap a virtual address
-    pub fn unmap(self: *AddressSpace, virt: u64) void {
-        unmapPage(@ptrFromInt(self.root), virt);
-    }
-
-    /// Map a range of pages
-    pub fn mapRange(self: *AddressSpace, virt_start: u64, phys_start: u64, size: u64, flags: u64) !void {
+    /// Map a range of pages (returns false on first failure)
+    pub fn mapRangeRaw(self: *AddressSpace, virt_start: u64, phys_start: u64, size: u64, flags: u64) bool {
         var virt = virt_start;
         var phys = phys_start;
         const end = virt_start + size;
@@ -271,8 +272,19 @@ pub const AddressSpace = struct {
             virt += PAGE_SIZE;
             phys += PAGE_SIZE;
         }) {
-            try self.map(virt, phys, flags);
+            if (!self.mapRaw(virt, phys, flags)) return false;
         }
+        return true;
+    }
+
+    /// Unmap a virtual address
+    pub fn unmap(self: *AddressSpace, virt: u64) void {
+        unmapPage(@ptrFromInt(self.root), virt);
+    }
+
+    /// Get the TTBR0 value for this address space (combines root + ASID)
+    pub fn getTtbr0(self: *const AddressSpace) u64 {
+        return self.root | (@as(u64, self.asid) << 48);
     }
 };
 
@@ -537,13 +549,17 @@ pub fn init() void {
     // We only map what we need for initial kernel operation
     console.puts("  Identity mapping kernel space...\n");
 
-    // Map kernel code/data region (first 1MB as 4KB pages)
+    // Map kernel code/data region AND page table area
+    // The kernel code is in the first 1MB, but page tables get allocated
+    // starting at 1MB mark. We need to map enough to include them.
+    // Map 4MB to have headroom for page tables allocated during this mapping.
     var addr: u64 = boot.MEMORY_BASE;
-    const kernel_end = boot.MEMORY_BASE + 1 * 1024 * 1024; // 1MB for kernel
+    const kernel_end = boot.MEMORY_BASE + 4 * 1024 * 1024; // 4MB for kernel + page tables
     var page_count: u32 = 0;
 
+    // Map 4MB with kernel-only permissions
+    // Note: Userspace threads will need their own address space or special mapping
     while (addr < kernel_end) : (addr += PAGE_SIZE) {
-        // Print progress every 64 pages
         if (page_count % 64 == 0) {
             console.putc('.');
         }
@@ -597,27 +613,32 @@ pub fn init() void {
     writeTtbr1(l0_phys);
 
     // Enable MMU
-    console.puts("  Enabling MMU...\n");
+    console.puts("  Enabling MMU...");
     var sctlr = readSctlr();
     sctlr |= (1 << 0); // M bit - Enable MMU
     sctlr |= (1 << 2); // C bit - Enable data cache
     sctlr |= (1 << 12); // I bit - Enable instruction cache
 
-    // Ensure changes are visible
+    // Ensure changes are visible before enabling MMU
     asm volatile (
         \\dsb sy
         \\isb
     );
 
+    // Enable!
     writeSctlr(sctlr);
 
-    // Synchronization
+    // Synchronization after MMU enable
     asm volatile (
         \\isb
     );
 
+    console.puts("OK\n");
+
     // Invalidate TLB
+    console.puts("  Invalidating TLB...");
     invalidateTlbAll();
+    console.puts("OK\n");
 
     mmu_initialized = true;
     console.puts("  MMU enabled successfully\n");
@@ -642,4 +663,14 @@ pub fn getKernelRoot() u64 {
         return @intFromPtr(table);
     }
     return 0;
+}
+
+/// Map a page in the kernel address space (for dynamically allocated kernel memory)
+/// Returns true on success, false on failure
+/// NOTE: Does NOT invalidate TLB - caller should call invalidateTlbAll() after bulk updates
+pub fn mapKernelPageRaw(virt: u64, phys: u64, flags: u64) bool {
+    if (kernel_l0_table) |table| {
+        return mapPageRaw(table, virt, phys, flags);
+    }
+    return false;
 }

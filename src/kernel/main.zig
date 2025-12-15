@@ -71,7 +71,7 @@ pub fn init() noreturn {
     // Enter idle loop - scheduler will switch to test threads
     console.newline();
     console.puts(console.Color.dim);
-    console.puts("  Entering idle loop (threads will preempt)\n");
+    console.puts("  Entering idle loop (userspace threads will preempt)\n");
     console.puts(console.Color.reset);
 
     idle();
@@ -201,93 +201,59 @@ pub fn panic(msg: []const u8) noreturn {
 // Test Threads
 // ============================================================
 
-/// Create test threads to verify userspace execution
+/// Create test processes/threads
+/// Now uses proper per-process address spaces with separate TTBR0
 fn createTestThreads() void {
+    const user_program = root.user_program;
+
     console.puts("  Free frames before: ");
     console.putDec(memory.getFreeFrames());
     console.newline();
 
-    // Create USERSPACE threads - they run in EL0 with restricted privileges
-    if (scheduler.createUserThread(&threadA, .normal)) |t| {
-        console.puts("  Thread A created (TID ");
+    // Create TRUE USER processes with their own address spaces
+    // Each process gets its own TTBR0 page table
+
+    // Process A: Simple yield loop
+    const code_a = user_program.getYieldLoopCode();
+    if (scheduler.createUserProcess(code_a, .normal)) |t| {
+        console.puts("  Process A created (PID ");
+        if (t.process) |p| {
+            console.putDec(p.pid);
+        }
+        console.puts(", TID ");
         console.putDec(t.tid);
         console.puts(") - ");
         console.puts(console.Color.green);
-        console.puts("USERSPACE (EL0)\n");
+        console.puts("USER (EL0)\n");
         console.puts(console.Color.reset);
     } else {
-        console.status("Thread A creation", false);
+        console.status("Process A creation", false);
     }
 
-    if (scheduler.createUserThread(&threadB, .normal)) |t| {
-        console.puts("  Thread B created (TID ");
+    // Process B: Another yield loop
+    const code_b = user_program.getYieldLoopCode();
+    if (scheduler.createUserProcess(code_b, .normal)) |t| {
+        console.puts("  Process B created (PID ");
+        if (t.process) |p| {
+            console.putDec(p.pid);
+        }
+        console.puts(", TID ");
         console.putDec(t.tid);
         console.puts(") - ");
         console.puts(console.Color.green);
-        console.puts("USERSPACE (EL0)\n");
+        console.puts("USER (EL0)\n");
         console.puts(console.Color.reset);
     } else {
-        console.status("Thread B creation", false);
+        console.status("Process B creation", false);
     }
 
     console.puts("  Free frames after: ");
     console.putDec(memory.getFreeFrames());
     console.newline();
 
-    console.status("Userspace threads ready", true);
+    console.status("Test processes ready", true);
 }
 
-const syscall = root.syscall;
-
-// Shared endpoint ID for IPC communication (created by thread B)
-var ipc_endpoint: u32 = 0;
-var endpoint_ready: bool = false;
-
-fn volatileLoad(ptr: *bool) bool {
-    return @as(*volatile bool, @ptrCast(ptr)).*;
-}
-
-fn volatileStore(ptr: *bool, val: bool) void {
-    @as(*volatile bool, @ptrCast(ptr)).* = val;
-}
-
-/// Test thread A - userspace sender
-fn threadA() void {
-    // Wait for endpoint to be ready (yield to let thread B run)
-    while (!volatileLoad(&endpoint_ready)) {
-        syscall.yield();
-    }
-
-    // Send messages via syscalls
-    var counter: u32 = 0;
-    while (true) {
-        counter +%= 1;
-        _ = syscall.syscall2(syscall.SYS.SEND, ipc_endpoint, counter);
-        busyWait(500000);
-    }
-}
-
-/// Test thread B - userspace receiver
-fn threadB() void {
-    // Create endpoint via syscall
-    const ep_result = syscall.syscall0(syscall.SYS.PORT_CREATE);
-    if (ep_result < 0) {
-        while (true) asm volatile ("nop");
-    }
-
-    ipc_endpoint = @intCast(@as(u64, @bitCast(ep_result)));
-    volatileStore(&endpoint_ready, true);
-
-    // Receive loop via syscalls
-    while (true) {
-        _ = syscall.syscall1(syscall.SYS.RECV, ipc_endpoint);
-    }
-}
-
-/// Simple busy-wait delay
-fn busyWait(iterations: u32) void {
-    var i: u32 = 0;
-    while (i < iterations) : (i += 1) {
-        asm volatile ("nop");
-    }
-}
+// Note: Old kernel thread test code has been removed.
+// The kernel now creates true userspace processes with per-process
+// address spaces. See createTestThreads() and user_program.zig.
