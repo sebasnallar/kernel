@@ -250,23 +250,122 @@ pub fn handleSync(esr: u64, elr: u64, far: u64) void {
 
     switch (ec) {
         .svc_aarch64 => {
-            // System call
-            // TODO: Dispatch based on syscall number in x8
-            _ = elr;
+            // System call - handled by vectors.zig el0_sync
+            // Parameters are passed through registers, not used here
         },
-        .data_abort_lower, .data_abort_same => {
-            // Page fault at address in FAR
-            // TODO: Handle page fault or kill process
-            _ = far;
+        .data_abort_lower => {
+            // Data abort from userspace (EL0) - kill the process
+            handleUserFault("Data abort", esr, elr, far);
         },
-        .inst_abort_lower, .inst_abort_same => {
-            // Instruction fetch fault
-            // TODO: Handle or kill process
+        .inst_abort_lower => {
+            // Instruction fetch fault from userspace (EL0) - kill the process
+            handleUserFault("Instruction abort", esr, elr, far);
+        },
+        .data_abort_same, .inst_abort_same => {
+            // Fault from kernel (EL1) - this is a kernel bug, panic!
+            kernelPanic("Kernel fault", ec, esr, elr, far);
+        },
+        .illegal_state => {
+            kernelPanic("Illegal state", ec, esr, elr, far);
+        },
+        .pc_alignment, .sp_alignment => {
+            // Alignment fault - kill user process or panic if kernel
+            if (isUserException(esr)) {
+                handleUserFault("Alignment fault", esr, elr, far);
+            } else {
+                kernelPanic("Kernel alignment fault", ec, esr, elr, far);
+            }
+        },
+        .serror => {
+            kernelPanic("SError interrupt", ec, esr, elr, far);
         },
         else => {
-            // Unhandled exception - panic
-            // TODO: Print exception info and halt
+            // Unhandled exception
+            console.puts("\n[EXCEPTION] Unhandled exception class: 0x");
+            console.putHex(@intFromEnum(ec));
+            console.puts(" ESR: 0x");
+            console.putHex(esr);
+            console.puts(" ELR: 0x");
+            console.putHex(elr);
+            console.puts("\n");
+            if (isUserException(esr)) {
+                handleUserFault("Unknown exception", esr, elr, far);
+            } else {
+                kernelPanic("Unknown kernel exception", ec, esr, elr, far);
+            }
         },
+    }
+}
+
+/// Check if exception originated from user mode (EL0)
+fn isUserException(esr: u64) bool {
+    // Bit 25 of ESR_EL1 indicates if exception was from lower level
+    // For data/instruction aborts, check EC[5] (bit 26+5=31)
+    // Actually, we can check by looking at the exception class
+    const ec: ExceptionClass = @enumFromInt(@as(u6, @truncate(esr >> 26)));
+    return switch (ec) {
+        .data_abort_lower, .inst_abort_lower, .svc_aarch64 => true,
+        else => false,
+    };
+}
+
+/// Handle a userspace fault by killing the process
+fn handleUserFault(reason: []const u8, esr: u64, elr: u64, far: u64) void {
+    console.puts("\n[FAULT] ");
+    console.puts(reason);
+    console.puts(" in user process\n");
+    console.puts("  ESR: 0x");
+    console.putHex(esr);
+    console.puts("  ELR: 0x");
+    console.putHex(elr);
+    console.puts("\n  FAR: 0x");
+    console.putHex(far);
+
+    // Get current process info
+    if (scheduler.getCurrent()) |thread| {
+        if (thread.process) |proc| {
+            console.puts("\n  PID: ");
+            console.putDec(proc.pid);
+            console.puts(" TID: ");
+            console.putDec(thread.tid);
+        }
+    }
+    console.puts("\n  Killing process...\n");
+
+    // Kill the faulting process with signal-like exit code (128 + signal)
+    // SIGSEGV = 11, so exit code = 139
+    scheduler.exitProcess(139);
+}
+
+/// Kernel panic - unrecoverable error
+fn kernelPanic(reason: []const u8, ec: ExceptionClass, esr: u64, elr: u64, far: u64) void {
+    console.puts("\n\n");
+    console.puts("╔══════════════════════════════════════════════════════════════╗\n");
+    console.puts("║                    KERNEL PANIC                              ║\n");
+    console.puts("╠══════════════════════════════════════════════════════════════╣\n");
+    console.puts("║ ");
+    console.puts(reason);
+    console.puts("\n");
+    console.puts("╠══════════════════════════════════════════════════════════════╣\n");
+    console.puts("║ Exception Class: 0x");
+    console.putHex(@intFromEnum(ec));
+    console.puts("\n");
+    console.puts("║ ESR_EL1:         0x");
+    console.putHex(esr);
+    console.puts("\n");
+    console.puts("║ ELR_EL1:         0x");
+    console.putHex(elr);
+    console.puts("\n");
+    console.puts("║ FAR_EL1:         0x");
+    console.putHex(far);
+    console.puts("\n");
+    console.puts("╚══════════════════════════════════════════════════════════════╝\n");
+    console.puts("\nSystem halted.\n");
+
+    // Halt the system
+    disableInterrupts();
+    while (true) {
+        asm volatile ("wfe");
     }
 }
 

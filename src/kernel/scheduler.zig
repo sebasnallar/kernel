@@ -71,7 +71,7 @@ pub const Thread = struct {
     total_runtime: u64,
 
     // Stack
-    stack_base: u64, // Base address of allocated stack
+    stack_base: u64, // Base address of allocated stack (physical)
     stack_size: u32, // Size in bytes
 
     // Queue linkage
@@ -88,6 +88,9 @@ pub const Thread = struct {
     is_user: bool, // True if this runs in EL0 (userspace)
     user_sp: u64, // User stack pointer (SP_EL0)
     kernel_sp: u64, // Kernel stack for syscall/exception handling
+
+    // Resource tracking for cleanup
+    kernel_stack_base: u64, // Physical address of kernel stack (for freeing)
 };
 
 /// Process state
@@ -96,6 +99,17 @@ pub const ProcessState = enum {
     zombie, // Process exited, waiting for parent to wait()
     dead, // Process fully cleaned up
 };
+
+/// Memory region descriptor for resource tracking
+pub const MemoryRegion = struct {
+    phys_base: u64, // Physical base address
+    page_count: u32, // Number of pages
+    in_use: bool, // Whether this slot is active
+};
+
+/// Maximum tracked memory regions per process
+/// Following seL4/L4 approach: explicit resource tracking
+const MAX_REGIONS_PER_PROCESS = 8;
 
 /// Process Control Block
 pub const Process = struct {
@@ -115,6 +129,33 @@ pub const Process = struct {
     // Process state and exit info
     state: ProcessState,
     exit_code: i32,
+
+    // Resource tracking (L4/seL4 style - explicit resource management)
+    // All physical memory owned by this process is tracked here
+    memory_regions: [MAX_REGIONS_PER_PROCESS]MemoryRegion,
+
+    /// Add a memory region to tracking
+    pub fn trackMemory(self: *Process, phys: u64, pages: u32) bool {
+        for (&self.memory_regions) |*region| {
+            if (!region.in_use) {
+                region.phys_base = phys;
+                region.page_count = pages;
+                region.in_use = true;
+                return true;
+            }
+        }
+        return false; // No free slots
+    }
+
+    /// Free all tracked memory regions
+    pub fn freeAllMemory(self: *Process) void {
+        for (&self.memory_regions) |*region| {
+            if (region.in_use) {
+                memory.freePages(region.phys_base, region.page_count);
+                region.in_use = false;
+            }
+        }
+    }
 };
 
 // ============================================================
@@ -122,9 +163,16 @@ pub const Process = struct {
 // ============================================================
 
 const NUM_PRIORITIES = 5;
-const MAX_THREADS = 16; // Keep small for now
-const MAX_PROCESSES = 8;
+const MAX_THREADS = 64; // Increased from 16
+const MAX_PROCESSES = 32; // Increased from 8
 const KERNEL_STACK_SIZE: u32 = 16384; // 16KB stack per kernel thread
+
+/// Default empty memory region
+const EMPTY_REGION = MemoryRegion{
+    .phys_base = 0,
+    .page_count = 0,
+    .in_use = false,
+};
 
 /// Thread storage (zeroed, not undefined)
 var threads: [MAX_THREADS]Thread = [_]Thread{Thread{
@@ -143,6 +191,7 @@ var threads: [MAX_THREADS]Thread = [_]Thread{Thread{
     .is_user = false,
     .user_sp = 0,
     .kernel_sp = 0,
+    .kernel_stack_base = 0,
 }} ** MAX_THREADS;
 var thread_used: [MAX_THREADS]bool = [_]bool{false} ** MAX_THREADS;
 
@@ -156,6 +205,7 @@ var processes: [MAX_PROCESSES]Process = [_]Process{Process{
     .parent_pid = null,
     .state = .dead,
     .exit_code = 0,
+    .memory_regions = [_]MemoryRegion{EMPTY_REGION} ** MAX_REGIONS_PER_PROCESS,
 }} ** MAX_PROCESSES;
 var process_used: [MAX_PROCESSES]bool = [_]bool{false} ** MAX_PROCESSES;
 
@@ -741,6 +791,13 @@ pub fn createUserProcess(code: []const u8, priority: Priority) ?*Thread {
     proc.parent_pid = null;
     proc.state = .running;
     proc.exit_code = 0;
+    // Clear and initialize memory tracking (L4/seL4 style resource management)
+    for (&proc.memory_regions) |*region| {
+        region.* = EMPTY_REGION;
+    }
+    // Track allocated memory - code and stack owned by this process
+    _ = proc.trackMemory(code_phys, @intCast(code_pages_count));
+    _ = proc.trackMemory(stack_phys, @intCast(stack_pages));
     next_pid += 1;
 
     // Step 8: Create the main thread for this process
@@ -777,6 +834,10 @@ pub fn createUserProcess(code: []const u8, priority: Priority) ?*Thread {
     thread.is_user = true;
     thread.user_sp = user_program.USER_STACK_BASE; // Virtual user stack top
     thread.kernel_sp = kernel_stack_top;
+    thread.kernel_stack_base = kernel_stack_base; // Track for cleanup
+
+    // Track kernel stack in process memory (so it gets freed on process exit)
+    _ = proc.trackMemory(kernel_stack_base, @intCast(kernel_stack_pages));
 
     // Initialize CPU context
     context.initUserContext(
@@ -910,11 +971,17 @@ pub fn findProcess(pid: Pid) ?*Process {
 }
 
 /// Clean up a zombie process (free all resources)
+/// Following L4/seL4 design: explicit resource tracking and deallocation
 fn cleanupProcess(proc: *Process) void {
-    // Free address space page tables
-    // TODO: Actually free physical pages used by process
+    // Free all tracked memory regions (code, stack, kernel stack)
+    // This is the key fix - we now properly free all process memory
+    proc.freeAllMemory();
 
-    // Mark as fully dead
+    // Destroy address space (frees page tables and ASID)
+    var addr_space = proc.address_space;
+    addr_space.destroy();
+
+    // Mark as fully dead and free the PCB slot
     proc.state = .dead;
     freeProcess(proc);
 }

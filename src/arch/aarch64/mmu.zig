@@ -252,9 +252,9 @@ pub const AddressSpace = struct {
     }
 
     pub fn destroy(self: *AddressSpace) void {
-        // TODO: Walk and free all page tables
+        // Walk and free all page tables (L4-style recursive cleanup)
+        freePageTableTree(@ptrFromInt(self.root), 0);
         freeAsid(self.asid);
-        memory.freeFrame(self.root);
     }
 
     /// Map a virtual address to a physical address (returns false on failure)
@@ -394,6 +394,47 @@ fn mapPageRaw(l0: *PageTable, virt: u64, phys: u64, flags: u64) bool {
 fn mapPage(l0: *PageTable, virt: u64, phys: u64, flags: u64) !void {
     if (!mapPageRaw(l0, virt, phys, flags)) {
         return error.OutOfMemory;
+    }
+}
+
+/// Recursively free all page tables in a tree
+/// level: 0=L0, 1=L1, 2=L2, 3=L3
+/// Note: Does NOT free the leaf pages (those are tracked separately in Process.memory_regions)
+/// This follows L4/seL4 design where data pages are tracked separately from page table pages
+fn freePageTableTree(table: *PageTable, level: u8) void {
+    const boot = root.boot;
+
+    // Walk all entries in this table
+    for (table.entries) |entry| {
+        // Skip invalid entries
+        if ((entry & PTE.VALID) == 0) continue;
+
+        // At L3, entries point to data pages (tracked separately), not tables
+        if (level == 3) continue;
+
+        // Get the address of the next-level table
+        const next_addr = entry & PTE.ADDR_MASK;
+
+        // Skip kernel memory (don't free kernel pages)
+        // Kernel is identity-mapped at 0x40000000
+        if (next_addr >= boot.MEMORY_BASE and next_addr < boot.MEMORY_BASE + 4 * 1024 * 1024) {
+            continue;
+        }
+
+        // Recurse into next level
+        const next_table: *PageTable = @ptrFromInt(next_addr);
+        freePageTableTree(next_table, level + 1);
+
+        // Free the next-level table itself
+        memory.freeFrame(next_addr);
+    }
+
+    // Free this table (except L0 which is freed in destroy())
+    if (level > 0) {
+        // Table was already freed by parent, don't double-free
+    } else {
+        // L0 table - free it
+        memory.freeFrame(@intFromPtr(table));
     }
 }
 

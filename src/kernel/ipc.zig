@@ -18,8 +18,8 @@ const scheduler = root.scheduler;
 /// Maximum message payload size
 pub const MAX_MSG_SIZE: usize = 64; // Keep it small
 
-/// Maximum endpoints (keep small for now)
-const MAX_ENDPOINTS: usize = 32;
+/// Maximum endpoints (increased for more services)
+const MAX_ENDPOINTS: usize = 64;
 
 // ============================================================
 // Types
@@ -90,16 +90,48 @@ const EndpointState = enum(u8) {
 // Forward declare the SyscallFrame type from syscall module
 const SyscallFrame = @import("root").syscall.SyscallFrame;
 
-/// Lightweight endpoint (no message buffering - pure rendezvous)
+/// Waiting sender entry (linked list node)
+/// Following L4/seL4 style: queue of waiting senders per endpoint
+const WaitingSender = struct {
+    thread: *scheduler.Thread,
+    msg: Message,
+    next: ?*WaitingSender,
+};
+
+/// Maximum concurrent waiting senders per endpoint
+const MAX_WAITING_SENDERS = 8;
+
+/// Pool of waiting sender entries
+var sender_pool: [MAX_ENDPOINTS * MAX_WAITING_SENDERS]WaitingSender = undefined;
+var sender_pool_used: [MAX_ENDPOINTS * MAX_WAITING_SENDERS]bool = [_]bool{false} ** (MAX_ENDPOINTS * MAX_WAITING_SENDERS);
+
+fn allocWaitingSender() ?*WaitingSender {
+    for (&sender_pool, 0..) |*entry, i| {
+        if (!sender_pool_used[i]) {
+            sender_pool_used[i] = true;
+            entry.next = null;
+            return entry;
+        }
+    }
+    return null;
+}
+
+fn freeWaitingSender(entry: *WaitingSender) void {
+    const idx = (@intFromPtr(entry) - @intFromPtr(&sender_pool[0])) / @sizeOf(WaitingSender);
+    if (idx < sender_pool_used.len) {
+        sender_pool_used[idx] = false;
+    }
+}
+
+/// Lightweight endpoint with sender queue (L4/seL4 style)
 const Endpoint = struct {
     state: EndpointState = .free,
     owner_tid: u32 = 0,
-    // Waiting thread (only one at a time for simplicity)
-    waiting_sender: ?*scheduler.Thread = null,
+    // Queue of waiting senders (head of linked list)
+    sender_queue_head: ?*WaitingSender = null,
+    sender_queue_tail: ?*WaitingSender = null,
+    // Waiting receiver (still single - receivers wait for ANY sender)
     waiting_receiver: ?*scheduler.Thread = null,
-    // Pending message from blocked sender
-    pending_msg: Message = .{},
-    has_pending_msg: bool = false,
     // For receiver to store where to put the result
     receiver_buf: ?*Message = null,
     // For receiver's syscall frame (to set return values directly)
@@ -107,6 +139,38 @@ const Endpoint = struct {
     // For pending notification
     notification_pending: bool = false,
     notification_badge: u64 = 0,
+
+    /// Add a sender to the wait queue
+    fn enqueueSender(self: *Endpoint, thread: *scheduler.Thread, msg: *const Message) bool {
+        const entry = allocWaitingSender() orelse return false;
+        entry.thread = thread;
+        copyMessage(&entry.msg, msg);
+        entry.next = null;
+
+        if (self.sender_queue_tail) |tail| {
+            tail.next = entry;
+            self.sender_queue_tail = entry;
+        } else {
+            self.sender_queue_head = entry;
+            self.sender_queue_tail = entry;
+        }
+        return true;
+    }
+
+    /// Dequeue the first waiting sender
+    fn dequeueSender(self: *Endpoint) ?*WaitingSender {
+        const head = self.sender_queue_head orelse return null;
+        self.sender_queue_head = head.next;
+        if (self.sender_queue_head == null) {
+            self.sender_queue_tail = null;
+        }
+        return head;
+    }
+
+    /// Check if there are waiting senders
+    fn hasWaitingSenders(self: *const Endpoint) bool {
+        return self.sender_queue_head != null;
+    }
 };
 
 /// IPC errors
@@ -182,6 +246,7 @@ fn copyMessage(dst: *Message, src: *const Message) void {
 }
 
 /// Send a message (synchronous - blocks until received)
+/// L4/seL4 style: senders queue up if no receiver is waiting
 pub fn send(dest: EndpointId, msg: *const Message) IpcError!void {
     if (!initialized) return IpcError.InvalidEndpoint;
 
@@ -200,15 +265,10 @@ pub fn send(dest: EndpointId, msg: *const Message) IpcError!void {
                 recv_buf.sender = EndpointId.fromRaw(cur.tid);
             }
         }
-        // Also set the receiver's syscall frame return values directly
-        // This ensures when the receiver returns from the blocked syscall,
-        // it has the correct return values without needing to continue execution
+        // Set the receiver's syscall frame return values directly
         if (ep.receiver_frame) |frame| {
-            // x0 = op (return value)
             frame.x0 = msg.op;
-            // x1 = arg0
             frame.x1 = msg.arg0;
-            // x2 = arg1
             frame.x2 = msg.arg1;
         }
         ep.waiting_receiver = null;
@@ -216,19 +276,20 @@ pub fn send(dest: EndpointId, msg: *const Message) IpcError!void {
         ep.receiver_frame = null;
         scheduler.unblock(receiver);
     } else {
-        // No receiver waiting - store and block
-        copyMessage(&ep.pending_msg, msg);
+        // No receiver waiting - add to sender queue and block
+        // Create message with sender ID
+        var msg_with_sender = msg.*;
         if (scheduler.getCurrent()) |cur| {
-            ep.pending_msg.sender = EndpointId.fromRaw(cur.tid);
+            msg_with_sender.sender = EndpointId.fromRaw(cur.tid);
         }
-        ep.has_pending_msg = true;
+
+        // Enqueue sender (L4/seL4 style queuing)
         if (scheduler.getCurrent()) |cur| {
-            ep.waiting_sender = cur;
+            if (!ep.enqueueSender(cur, &msg_with_sender)) {
+                return IpcError.WouldBlock; // Queue full
+            }
         }
         scheduler.blockCurrent(.blocked_ipc);
-        // NOTE: With deferred scheduling, execution continues here immediately.
-        // The receiver's tryReceive will clear has_pending_msg when it picks up
-        // the message and unblocks us. We don't clear it here.
     }
 }
 
@@ -245,6 +306,7 @@ fn clearMessage(msg: *Message) void {
 }
 
 /// Receive a message (synchronous - blocks until message arrives)
+/// L4/seL4 style: dequeue from sender queue if available
 pub fn receive(from: EndpointId, msg: *Message) IpcError!void {
     if (!initialized) return IpcError.InvalidEndpoint;
 
@@ -262,27 +324,20 @@ pub fn receive(from: EndpointId, msg: *Message) IpcError!void {
         return;
     }
 
-    // Check if there's a waiting sender with a message
-    if (ep.waiting_sender) |sender| {
-        if (ep.has_pending_msg) {
-            copyMessage(msg, &ep.pending_msg);
-            ep.has_pending_msg = false;
-        }
-        ep.waiting_sender = null;
-        scheduler.unblock(sender);
+    // Check if there are waiting senders in the queue
+    if (ep.dequeueSender()) |sender_entry| {
+        // Get message from queued sender
+        copyMessage(msg, &sender_entry.msg);
+        const sender_thread = sender_entry.thread;
+        freeWaitingSender(sender_entry);
+        scheduler.unblock(sender_thread);
     } else {
         // No sender waiting - block until one arrives
-        const console = root.console;
-        console.puts("[IPC] No sender, blocking receiver\n");
         if (scheduler.getCurrent()) |cur| {
             ep.waiting_receiver = cur;
         }
         ep.receiver_buf = msg;
-        // Mark as blocked - the actual reschedule happens when syscall returns
-        // We need to check if a message arrived after we're unblocked
         scheduler.blockCurrent(.blocked_ipc);
-        // When we return here, the sender should have filled our message buffer
-        console.puts("[IPC] Receiver unblocked\n");
         ep.receiver_buf = null;
     }
 }
@@ -296,6 +351,7 @@ pub const TryReceiveResult = enum(u8) {
 };
 
 /// Non-blocking receive - returns simple enum to avoid error union issues
+/// L4/seL4 style: dequeue from sender queue if available
 pub fn tryReceive(from: EndpointId, msg: *Message) TryReceiveResult {
     if (!initialized) return .invalid_endpoint;
 
@@ -313,15 +369,13 @@ pub fn tryReceive(from: EndpointId, msg: *Message) TryReceiveResult {
         return .got_message;
     }
 
-    // Check if there's a waiting sender with a message
-    if (ep.waiting_sender) |sender| {
-        if (ep.has_pending_msg) {
-            copyMessage(msg, &ep.pending_msg);
-            ep.has_pending_msg = false;
-            ep.waiting_sender = null;
-            scheduler.unblock(sender);
-            return .got_message;
-        }
+    // Check if there are waiting senders in the queue
+    if (ep.dequeueSender()) |sender_entry| {
+        copyMessage(msg, &sender_entry.msg);
+        const sender_thread = sender_entry.thread;
+        freeWaitingSender(sender_entry);
+        scheduler.unblock(sender_thread);
+        return .got_message;
     }
 
     return .no_message;

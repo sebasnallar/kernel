@@ -116,17 +116,21 @@ export fn _start() callconv(.C) noreturn {
         yield();
     }
 
-    // Step 2: Spawn application process
-    write("[init] Spawning hello process...\n");
+    // Step 2: Spawn multiple application processes (test IPC sender queue)
+    write("[init] Spawning 3 hello processes...\n");
 
-    const hello_pid = spawn(BINARY_HELLO);
-    write("[init] Spawned hello (PID ");
-    if (hello_pid > 0) {
-        putDec(@bitCast(hello_pid));
-    } else {
-        write("ERROR");
+    var pids: [3]i64 = undefined;
+    var j: usize = 0;
+    while (j < 3) : (j += 1) {
+        pids[j] = spawn(BINARY_HELLO);
+        write("[init] Spawned hello (PID ");
+        if (pids[j] > 0) {
+            putDec(@bitCast(pids[j]));
+        } else {
+            write("ERROR");
+        }
+        write(")\n");
     }
-    write(")\n");
 
     // Let everything run
     write("[init] System running. Entering idle loop.\n");
