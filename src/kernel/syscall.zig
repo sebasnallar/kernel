@@ -11,6 +11,7 @@
 const root = @import("root");
 const scheduler = root.scheduler;
 const ipc = root.ipc;
+const console = root.console;
 
 // ============================================================
 // System Call Numbers
@@ -99,6 +100,10 @@ pub const SyscallFrame = struct {
 // System Call Dispatcher
 // ============================================================
 
+/// Special return value indicating "don't modify frame.x0"
+/// Used by blocking syscalls that will have their return value set by unblocking code
+const SYSCALL_BLOCKED: i64 = -0x7FFFFFFF_FFFFFFFF;
+
 /// Main syscall dispatcher - called from exception handler
 /// Returns the result in frame.x0
 pub fn dispatch(frame: *SyscallFrame) void {
@@ -129,7 +134,10 @@ pub fn dispatch(frame: *SyscallFrame) void {
     };
 
     // Store result in x0 (will be restored on return)
-    frame.x0 = @bitCast(result);
+    // UNLESS it's SYSCALL_BLOCKED, which means the sender will set the return value
+    if (result != SYSCALL_BLOCKED) {
+        frame.x0 = @bitCast(result);
+    }
 }
 
 // ============================================================
@@ -149,7 +157,12 @@ fn sysExit(frame: *SyscallFrame) i64 {
 
 /// Yield time slice to another thread
 fn sysYield() i64 {
-    scheduler.yield();
+    // For EL0 threads, we need to trigger a reschedule after the syscall returns.
+    // This is done by setting need_reschedule and re-enqueueing the current thread.
+    if (scheduler.getCurrent()) |thread| {
+        scheduler.enqueue(thread);
+    }
+    scheduler.setNeedReschedule();
     return 0;
 }
 
@@ -171,24 +184,27 @@ fn sysGetTid() i64 {
     return 0;
 }
 
-const console = root.console;
 
-// Debug counter for syscall activity
-var send_count: u32 = 0;
-var recv_count: u32 = 0;
-
-// Static buffer for send (avoid stack issues)
-var send_msg_buf: ipc.Message = .{};
+// Static send buffer to avoid stack issues with struct initialization
+var send_msg_buf: ipc.Message = .{
+    .op = 0,
+    .arg0 = 0,
+    .arg1 = 0,
+    .arg2 = 0,
+    .arg3 = 0,
+    .sender = .invalid,
+    .reply_to = .invalid,
+    .badge = 0,
+};
 
 /// Send message to a port
 /// x0 = port_id, x1 = op, x2 = arg0, x3 = arg1
 fn sysSend(frame: *SyscallFrame) i64 {
     const port_id: u32 = @truncate(frame.x0);
-    const op: u32 = @truncate(frame.x1);
     const endpoint = ipc.EndpointId.fromRaw(port_id);
 
-    // Build message in static buffer
-    send_msg_buf.op = op;
+    // Fill static buffer field by field
+    send_msg_buf.op = @truncate(frame.x1);
     send_msg_buf.arg0 = frame.x2;
     send_msg_buf.arg1 = frame.x3;
     send_msg_buf.arg2 = 0;
@@ -197,30 +213,27 @@ fn sysSend(frame: *SyscallFrame) i64 {
     send_msg_buf.reply_to = .invalid;
     send_msg_buf.badge = 0;
 
-    // Try to send
     ipc.send(endpoint, &send_msg_buf) catch |err| {
         return switch (err) {
-            ipc.IpcError.InvalidEndpoint => @intFromEnum(Error.INVALID_PORT),
-            ipc.IpcError.EndpointClosed => @intFromEnum(Error.INVALID_PORT),
+            ipc.IpcError.InvalidEndpoint, ipc.IpcError.EndpointClosed => @intFromEnum(Error.INVALID_PORT),
             else => @intFromEnum(Error.INVALID_ARGUMENT),
         };
     };
 
-    send_count += 1;
-    if (send_count % 10 == 1) {
-        console.puts(console.Color.cyan);
-        console.puts("[KERN] Send #");
-        console.putDec(send_count);
-        console.puts(" op=");
-        console.putDec(op);
-        console.newline();
-        console.puts(console.Color.reset);
-    }
     return 0;
 }
 
-// Static buffer for receive (avoid stack issues)
-var recv_msg_buf: ipc.Message = .{};
+// Static receive buffer to avoid stack issues with struct initialization
+var recv_msg_buf: ipc.Message = .{
+    .op = 0,
+    .arg0 = 0,
+    .arg1 = 0,
+    .arg2 = 0,
+    .arg3 = 0,
+    .sender = .invalid,
+    .reply_to = .invalid,
+    .badge = 0,
+};
 
 /// Receive message from a port
 /// x0 = port_id, returns: x0 = op, x1 = arg0, x2 = arg1
@@ -228,27 +241,38 @@ fn sysRecv(frame: *SyscallFrame) i64 {
     const port_id: u32 = @truncate(frame.x0);
     const endpoint = ipc.EndpointId.fromRaw(port_id);
 
-    // Try to receive (blocking) using static buffer
-    ipc.receive(endpoint, &recv_msg_buf) catch |err| {
-        return switch (err) {
-            ipc.IpcError.InvalidEndpoint => @intFromEnum(Error.INVALID_PORT),
-            ipc.IpcError.EndpointClosed => @intFromEnum(Error.INVALID_PORT),
-            else => @intFromEnum(Error.INVALID_ARGUMENT),
-        };
-    };
+    // Clear the static buffer
+    recv_msg_buf.op = 0;
+    recv_msg_buf.arg0 = 0;
+    recv_msg_buf.arg1 = 0;
+    recv_msg_buf.arg2 = 0;
+    recv_msg_buf.arg3 = 0;
+    recv_msg_buf.sender = .invalid;
+    recv_msg_buf.reply_to = .invalid;
+    recv_msg_buf.badge = 0;
 
-    recv_count += 1;
-    if (recv_count % 10 == 1) {
-        console.puts(console.Color.green);
-        console.puts("[KERN] Recv #");
-        console.putDec(recv_count);
-        console.puts(" op=");
-        console.putDec(recv_msg_buf.op);
-        console.newline();
-        console.puts(console.Color.reset);
+    // Try to receive - if no message available, register as waiting and block
+    const result = ipc.tryReceive(endpoint, &recv_msg_buf);
+
+    // Check for errors
+    if (result == .invalid_endpoint or result == .endpoint_closed) {
+        return @intFromEnum(Error.INVALID_PORT);
     }
 
-    // Put results in frame for return
+    if (result == .no_message) {
+        // Register as waiting receiver so sender can find us
+        // Pass the frame pointer so sender can set return values directly
+        ipc.registerWaitingReceiver(endpoint, &recv_msg_buf, frame);
+        scheduler.blockCurrent(.blocked_ipc);
+        // When the sender delivers a message, it will:
+        // 1. Copy message to recv_msg_buf
+        // 2. Set frame.x0/x1/x2 with return values directly
+        // 3. Unblock this thread
+        // Return SYSCALL_BLOCKED to tell dispatch() not to overwrite frame.x0
+        return SYSCALL_BLOCKED;
+    }
+
+    // Got a message immediately (sender was waiting)
     frame.x1 = recv_msg_buf.arg0;
     frame.x2 = recv_msg_buf.arg1;
     return @intCast(recv_msg_buf.op);

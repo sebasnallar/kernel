@@ -112,7 +112,7 @@ pub const Process = struct {
 const NUM_PRIORITIES = 5;
 const MAX_THREADS = 16; // Keep small for now
 const MAX_PROCESSES = 8;
-const KERNEL_STACK_SIZE: u32 = 4096; // 4KB stack per kernel thread
+const KERNEL_STACK_SIZE: u32 = 16384; // 16KB stack per kernel thread
 
 /// Thread storage (zeroed, not undefined)
 var threads: [MAX_THREADS]Thread = [_]Thread{Thread{
@@ -170,55 +170,43 @@ var need_reschedule: bool = false;
 
 /// Initialize the scheduler
 pub fn init() void {
-    // Clear all thread slots
-    for (&thread_used) |*used| {
-        used.* = false;
-    }
-
-    // Clear all process slots
-    for (&process_used) |*used| {
-        used.* = false;
-    }
-
-    // Clear ready queues
-    for (&ready_queues) |*q| {
-        q.* = null;
-    }
-
     // Create the idle thread (uses boot stack, no allocation needed)
-    const maybe_thread = allocThread();
-    if (maybe_thread) |thread| {
-        idle_thread = thread;
-        // Set fields individually to avoid SIMD memset issues in freestanding
-        idle_thread.tid = 0;
-        idle_thread.state = .running; // Idle starts as "current" thread
-        idle_thread.priority = .idle;
-        idle_thread.context.x19 = 0;
-        idle_thread.context.x20 = 0;
-        idle_thread.context.x21 = 0;
-        idle_thread.context.x22 = 0;
-        idle_thread.context.x23 = 0;
-        idle_thread.context.x24 = 0;
-        idle_thread.context.x25 = 0;
-        idle_thread.context.x26 = 0;
-        idle_thread.context.x27 = 0;
-        idle_thread.context.x28 = 0;
-        idle_thread.context.x29 = 0;
-        idle_thread.context.x30 = 0;
-        idle_thread.context.sp = 0;
-        idle_thread.context.pc = 0;
-        idle_thread.time_slice = 1;
-        idle_thread.total_runtime = 0;
-        idle_thread.stack_base = 0; // Uses boot stack
-        idle_thread.stack_size = 0;
-        idle_thread.next = null;
-        idle_thread.prev = null;
-        idle_thread.process = null;
-        idle_thread.first_run = false; // Already running
-        current = idle_thread; // Boot thread becomes idle thread
-        initialized = true;
-    }
-    // If allocThread fails, initialized stays false
+    const thread = allocThread() orelse return;
+
+    // Set fields individually to avoid SIMD/memset in freestanding mode
+    idle_thread = thread;
+    idle_thread.tid = 0;
+    idle_thread.state = .running;
+    idle_thread.priority = .idle;
+    // Context fields set individually
+    idle_thread.context.x19 = 0;
+    idle_thread.context.x20 = 0;
+    idle_thread.context.x21 = 0;
+    idle_thread.context.x22 = 0;
+    idle_thread.context.x23 = 0;
+    idle_thread.context.x24 = 0;
+    idle_thread.context.x25 = 0;
+    idle_thread.context.x26 = 0;
+    idle_thread.context.x27 = 0;
+    idle_thread.context.x28 = 0;
+    idle_thread.context.x29 = 0;
+    idle_thread.context.x30 = 0;
+    idle_thread.context.sp = 0;
+    idle_thread.context.pc = 0;
+    idle_thread.time_slice = 1;
+    idle_thread.total_runtime = 0;
+    idle_thread.stack_base = 0;
+    idle_thread.stack_size = 0;
+    idle_thread.next = null;
+    idle_thread.prev = null;
+    idle_thread.process = null;
+    idle_thread.first_run = false;
+    idle_thread.is_user = false;
+    idle_thread.user_sp = 0;
+    idle_thread.kernel_sp = 0;
+
+    current = idle_thread;
+    initialized = true;
 }
 
 // ============================================================
@@ -248,8 +236,9 @@ fn freeThread(thread: *Thread) void {
 pub fn createKernelThread(entry: *const fn () void, priority: Priority) ?*Thread {
     const thread = allocThread() orelse return null;
 
-    // Allocate stack (single 4KB page)
-    const stack_base = memory.allocFrame() orelse {
+    // Allocate stack (contiguous pages for 16KB)
+    const stack_pages = KERNEL_STACK_SIZE / memory.PAGE_SIZE;
+    const stack_base = memory.allocContiguous(stack_pages) orelse {
         freeThread(thread);
         return null;
     };
@@ -287,16 +276,18 @@ pub fn createKernelThread(entry: *const fn () void, priority: Priority) ?*Thread
 pub fn createUserThread(entry: *const fn () void, priority: Priority) ?*Thread {
     const thread = allocThread() orelse return null;
 
+    const stack_pages = KERNEL_STACK_SIZE / memory.PAGE_SIZE;
+
     // Allocate USER stack (where the thread runs)
-    const user_stack_base = memory.allocFrame() orelse {
+    const user_stack_base = memory.allocContiguous(stack_pages) orelse {
         freeThread(thread);
         return null;
     };
     const user_stack_top = user_stack_base + KERNEL_STACK_SIZE;
 
     // Allocate KERNEL stack (for handling syscalls/exceptions)
-    const kernel_stack_base = memory.allocFrame() orelse {
-        memory.freeFrame(user_stack_base);
+    const kernel_stack_base = memory.allocContiguous(stack_pages) orelse {
+        memory.freePages(user_stack_base, stack_pages);
         freeThread(thread);
         return null;
     };
@@ -345,8 +336,13 @@ fn getTimeSlice(priority: Priority) u32 {
 // Scheduling
 // ============================================================
 
+/// Set the need_reschedule flag (for syscalls that want to yield)
+pub fn setNeedReschedule() void {
+    need_reschedule = true;
+}
+
 /// Add thread to ready queue
-fn enqueue(thread: *Thread) void {
+pub fn enqueue(thread: *Thread) void {
     const qi = @intFromEnum(thread.priority);
     thread.state = .ready;
     thread.next = null;
@@ -463,10 +459,15 @@ pub fn yield() void {
 }
 
 /// Block current thread
+/// For EL0 threads, we just set the state and flag for reschedule.
+/// The actual schedule() will happen after the syscall handler returns.
 pub fn blockCurrent(reason: State) void {
     if (current) |c| {
         c.state = reason;
-        schedule();
+        // Set flag for reschedule - checkReschedule() will call schedule()
+        // after the exception handler returns. This is necessary because
+        // we can't context switch from within a syscall handler directly.
+        need_reschedule = true;
     }
 }
 
@@ -518,6 +519,22 @@ pub fn checkReschedule() void {
         }
         schedule();
     }
+}
+
+/// Debug: check ready queue state
+pub fn debugReadyQueues() void {
+    console.puts("[DBG] Ready queues: ");
+    var qi: usize = 0;
+    while (qi < NUM_PRIORITIES) : (qi += 1) {
+        if (ready_queues[qi]) |thread| {
+            console.puts("Q");
+            console.putDec(@intCast(qi));
+            console.puts(":TID");
+            console.putDec(thread.tid);
+            console.puts(" ");
+        }
+    }
+    console.newline();
 }
 
 /// Get current thread

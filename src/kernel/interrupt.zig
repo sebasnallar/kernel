@@ -214,19 +214,17 @@ pub fn handleIrq() void {
     const iar = GICC_IAR.*;
     const irq = iar & 0x3FF;
 
-    if (irq >= 1020) {
-        // Spurious interrupt
-        return;
-    }
+    // Spurious interrupt check
+    if (irq >= 1020) return;
 
-    // Handle timer specially
-    if (irq == IRQ.TIMER_NS_PHYS) {
-        handleTimerIrq();
-    } else if (irq < MAX_IRQ) {
-        // Call registered handler
-        if (irq_handlers[irq]) |handler| {
-            handler();
-        }
+    // Dispatch interrupt
+    switch (irq) {
+        IRQ.TIMER_NS_PHYS => handleTimerIrq(),
+        else => {
+            if (irq < MAX_IRQ) {
+                if (irq_handlers[irq]) |handler| handler();
+            }
+        },
     }
 
     // Signal end of interrupt

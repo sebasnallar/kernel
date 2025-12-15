@@ -258,23 +258,34 @@ pub fn syncEntry() callconv(.Naked) void {
 const syscall = root.syscall;
 const scheduler = root.scheduler;
 
-export fn handleSyncWrapper(frame: *syscall.SyscallFrame) callconv(.C) void {
-    // Read ESR to determine exception type
-    var esr: u64 = undefined;
-    asm volatile ("mrs %[esr], esr_el1"
-        : [esr] "=r" (esr),
+/// ARM64 Exception Class values (ESR_EL1 bits 31:26)
+const ExceptionClass = struct {
+    const SVC_AARCH64: u6 = 0x15; // SVC instruction execution
+    const DATA_ABORT_LOWER: u6 = 0x24; // Data abort from lower EL
+    const DATA_ABORT_SAME: u6 = 0x25; // Data abort from same EL
+    const INST_ABORT_LOWER: u6 = 0x20; // Instruction abort from lower EL
+    const INST_ABORT_SAME: u6 = 0x21; // Instruction abort from same EL
+};
+
+fn readEsr() u64 {
+    return asm volatile ("mrs %[esr], esr_el1"
+        : [esr] "=r" (-> u64),
     );
+}
 
-    // Extract exception class (bits 31:26)
-    const ec = (esr >> 26) & 0x3F;
+fn getExceptionClass(esr: u64) u6 {
+    return @truncate((esr >> 26) & 0x3F);
+}
 
-    // EC 0x15 = SVC instruction (64-bit)
-    if (ec == 0x15) {
-        // This is a syscall - dispatch it
-        syscall.dispatch(frame);
-    } else {
-        // Other sync exception - for now just return
-        // TODO: Handle page faults, undefined instructions, etc.
+export fn handleSyncWrapper(frame: *syscall.SyscallFrame) callconv(.C) void {
+    const esr = readEsr();
+    const ec = getExceptionClass(esr);
+
+    switch (ec) {
+        ExceptionClass.SVC_AARCH64 => syscall.dispatch(frame),
+        else => {
+            // TODO: Handle page faults, undefined instructions, etc.
+        },
     }
 }
 
@@ -365,41 +376,41 @@ pub const El0Frame = struct {
     sp_el0: u64,
 };
 
-export fn handleEl0SyncWrapper(frame: *El0Frame) callconv(.C) void {
-    // Read ESR to determine exception type
-    var esr: u64 = undefined;
-    asm volatile ("mrs %[esr], esr_el1"
-        : [esr] "=r" (esr),
+fn readFar() u64 {
+    return asm volatile ("mrs %[far], far_el1"
+        : [far] "=r" (-> u64),
     );
+}
 
-    // Extract exception class (bits 31:26)
-    const ec = (esr >> 26) & 0x3F;
+export fn handleEl0SyncWrapper(frame: *El0Frame) callconv(.C) void {
+    const esr = readEsr();
+    const ec = getExceptionClass(esr);
 
-    // EC 0x15 = SVC instruction (64-bit)
-    if (ec == 0x15) {
-        // This is a syscall from userspace - dispatch it
-        // Cast to SyscallFrame (same layout for first 22 fields)
-        const syscall_frame: *syscall.SyscallFrame = @ptrCast(frame);
-        syscall.dispatch(syscall_frame);
-    } else {
-        // Other sync exception from userspace
-        console.puts(console.Color.red);
-        console.puts("[EL0] Sync EC=");
-        console.putHex(ec);
-        console.puts(" ESR=");
-        console.putHex(esr);
-        console.puts(" ELR=");
-        console.putHex(frame.elr);
-        console.puts(" FAR=");
-        // Read FAR_EL1 (fault address register)
-        var far: u64 = undefined;
-        asm volatile ("mrs %[far], far_el1"
-            : [far] "=r" (far),
-        );
-        console.putHex(far);
-        console.newline();
-        console.puts(console.Color.reset);
+    switch (ec) {
+        ExceptionClass.SVC_AARCH64 => {
+            // Syscall from userspace - dispatch it
+            const syscall_frame: *syscall.SyscallFrame = @ptrCast(frame);
+            syscall.dispatch(syscall_frame);
+        },
+        else => {
+            // Other sync exception from userspace - report error
+            console.puts(console.Color.red);
+            console.puts("[EL0] Sync EC=");
+            console.putHex(ec);
+            console.puts(" ESR=");
+            console.putHex(esr);
+            console.puts(" ELR=");
+            console.putHex(frame.elr);
+            console.puts(" FAR=");
+            console.putHex(readFar());
+            console.newline();
+            console.puts(console.Color.reset);
+        },
     }
+
+    // After syscall handling, check if we need to reschedule
+    // This handles the case where a syscall blocks (e.g., IPC receive)
+    scheduler.checkReschedule();
 }
 
 /// EL0 IRQ handler - handles interrupts while in userspace

@@ -10,7 +10,6 @@
 
 const root = @import("root");
 const scheduler = root.scheduler;
-const console = root.console;
 
 // ============================================================
 // Constants
@@ -88,6 +87,9 @@ const EndpointState = enum(u8) {
     closed,
 };
 
+// Forward declare the SyscallFrame type from syscall module
+const SyscallFrame = @import("root").syscall.SyscallFrame;
+
 /// Lightweight endpoint (no message buffering - pure rendezvous)
 const Endpoint = struct {
     state: EndpointState = .free,
@@ -100,6 +102,8 @@ const Endpoint = struct {
     has_pending_msg: bool = false,
     // For receiver to store where to put the result
     receiver_buf: ?*Message = null,
+    // For receiver's syscall frame (to set return values directly)
+    receiver_frame: ?*SyscallFrame = null,
     // For pending notification
     notification_pending: bool = false,
     notification_badge: u64 = 0,
@@ -127,31 +131,10 @@ var initialized: bool = false;
 
 /// Initialize the IPC subsystem
 pub fn init() void {
-    // Reset all endpoints (set fields individually to avoid SIMD/memset issues)
-    for (&endpoints) |*ep| {
-        ep.state = .free;
-        ep.owner_tid = 0;
-        ep.waiting_sender = null;
-        ep.waiting_receiver = null;
-        // Initialize pending_msg fields individually
-        ep.pending_msg.op = 0;
-        ep.pending_msg.arg0 = 0;
-        ep.pending_msg.arg1 = 0;
-        ep.pending_msg.arg2 = 0;
-        ep.pending_msg.arg3 = 0;
-        ep.pending_msg.sender = .invalid;
-        ep.pending_msg.reply_to = .invalid;
-        ep.pending_msg.badge = 0;
-        ep.has_pending_msg = false;
-        ep.receiver_buf = null;
-        ep.notification_pending = false;
-        ep.notification_badge = 0;
-    }
-
-    // Reserve endpoint 0 (invalid) and 1 (kernel)
+    // Endpoints are already zero-initialized at compile time
+    // Just set special states for reserved endpoints
     endpoints[0].state = .closed;
     endpoints[1].state = .active;
-    endpoints[1].owner_tid = 0;
 
     initialized = true;
 }
@@ -186,8 +169,17 @@ pub fn destroyEndpoint(id: EndpointId) void {
 // IPC Operations
 // ============================================================
 
-// Static buffer for send operation (avoid stack issues with large structs)
-var send_temp_msg: Message = .{};
+/// Copy message fields (avoids SIMD in freestanding)
+fn copyMessage(dst: *Message, src: *const Message) void {
+    dst.op = src.op;
+    dst.arg0 = src.arg0;
+    dst.arg1 = src.arg1;
+    dst.arg2 = src.arg2;
+    dst.arg3 = src.arg3;
+    dst.sender = src.sender;
+    dst.reply_to = src.reply_to;
+    dst.badge = src.badge;
+}
 
 /// Send a message (synchronous - blocks until received)
 pub fn send(dest: EndpointId, msg: *const Message) IpcError!void {
@@ -199,54 +191,57 @@ pub fn send(dest: EndpointId, msg: *const Message) IpcError!void {
     const ep = &endpoints[idx];
     if (ep.state != .active) return IpcError.EndpointClosed;
 
-    // Copy message fields individually to static buffer (avoid stack struct copy)
-    send_temp_msg.op = msg.op;
-    send_temp_msg.arg0 = msg.arg0;
-    send_temp_msg.arg1 = msg.arg1;
-    send_temp_msg.arg2 = msg.arg2;
-    send_temp_msg.arg3 = msg.arg3;
-    send_temp_msg.reply_to = msg.reply_to;
-    send_temp_msg.badge = msg.badge;
-
-    // Fill in sender info
-    if (scheduler.getCurrent()) |cur| {
-        send_temp_msg.sender = EndpointId.fromRaw(cur.tid);
-    }
-
     // Check if there's a waiting receiver
     if (ep.waiting_receiver) |receiver| {
-        // Direct handoff - copy message to receiver's buffer field-by-field
+        // Direct handoff to receiver's buffer
         if (ep.receiver_buf) |recv_buf| {
-            recv_buf.op = send_temp_msg.op;
-            recv_buf.arg0 = send_temp_msg.arg0;
-            recv_buf.arg1 = send_temp_msg.arg1;
-            recv_buf.arg2 = send_temp_msg.arg2;
-            recv_buf.arg3 = send_temp_msg.arg3;
-            recv_buf.sender = send_temp_msg.sender;
-            recv_buf.reply_to = send_temp_msg.reply_to;
-            recv_buf.badge = send_temp_msg.badge;
+            copyMessage(recv_buf, msg);
+            if (scheduler.getCurrent()) |cur| {
+                recv_buf.sender = EndpointId.fromRaw(cur.tid);
+            }
+        }
+        // Also set the receiver's syscall frame return values directly
+        // This ensures when the receiver returns from the blocked syscall,
+        // it has the correct return values without needing to continue execution
+        if (ep.receiver_frame) |frame| {
+            // x0 = op (return value)
+            frame.x0 = msg.op;
+            // x1 = arg0
+            frame.x1 = msg.arg0;
+            // x2 = arg1
+            frame.x2 = msg.arg1;
         }
         ep.waiting_receiver = null;
         ep.receiver_buf = null;
+        ep.receiver_frame = null;
         scheduler.unblock(receiver);
     } else {
-        // Store message field by field (avoid struct copy)
-        ep.pending_msg.op = send_temp_msg.op;
-        ep.pending_msg.arg0 = send_temp_msg.arg0;
-        ep.pending_msg.arg1 = send_temp_msg.arg1;
-        ep.pending_msg.arg2 = send_temp_msg.arg2;
-        ep.pending_msg.arg3 = send_temp_msg.arg3;
-        ep.pending_msg.sender = send_temp_msg.sender;
-        ep.pending_msg.reply_to = send_temp_msg.reply_to;
-        ep.pending_msg.badge = send_temp_msg.badge;
+        // No receiver waiting - store and block
+        copyMessage(&ep.pending_msg, msg);
+        if (scheduler.getCurrent()) |cur| {
+            ep.pending_msg.sender = EndpointId.fromRaw(cur.tid);
+        }
         ep.has_pending_msg = true;
         if (scheduler.getCurrent()) |cur| {
             ep.waiting_sender = cur;
         }
         scheduler.blockCurrent(.blocked_ipc);
-        // When we wake up, the receiver has taken our message
-        ep.has_pending_msg = false;
+        // NOTE: With deferred scheduling, execution continues here immediately.
+        // The receiver's tryReceive will clear has_pending_msg when it picks up
+        // the message and unblocks us. We don't clear it here.
     }
+}
+
+/// Clear a message to defaults
+fn clearMessage(msg: *Message) void {
+    msg.op = 0;
+    msg.arg0 = 0;
+    msg.arg1 = 0;
+    msg.arg2 = 0;
+    msg.arg3 = 0;
+    msg.sender = .invalid;
+    msg.reply_to = .invalid;
+    msg.badge = 0;
 }
 
 /// Receive a message (synchronous - blocks until message arrives)
@@ -261,13 +256,7 @@ pub fn receive(from: EndpointId, msg: *Message) IpcError!void {
 
     // Check for pending notification first
     if (ep.notification_pending) {
-        msg.op = 0;
-        msg.arg0 = 0;
-        msg.arg1 = 0;
-        msg.arg2 = 0;
-        msg.arg3 = 0;
-        msg.sender = .invalid;
-        msg.reply_to = .invalid;
+        clearMessage(msg);
         msg.badge = ep.notification_badge;
         ep.notification_pending = false;
         return;
@@ -276,61 +265,83 @@ pub fn receive(from: EndpointId, msg: *Message) IpcError!void {
     // Check if there's a waiting sender with a message
     if (ep.waiting_sender) |sender| {
         if (ep.has_pending_msg) {
-            // Copy the pending message field-by-field
-            msg.op = ep.pending_msg.op;
-            msg.arg0 = ep.pending_msg.arg0;
-            msg.arg1 = ep.pending_msg.arg1;
-            msg.arg2 = ep.pending_msg.arg2;
-            msg.arg3 = ep.pending_msg.arg3;
-            msg.sender = ep.pending_msg.sender;
-            msg.reply_to = ep.pending_msg.reply_to;
-            msg.badge = ep.pending_msg.badge;
+            copyMessage(msg, &ep.pending_msg);
             ep.has_pending_msg = false;
         }
         ep.waiting_sender = null;
         scheduler.unblock(sender);
     } else {
         // No sender waiting - block until one arrives
+        const console = root.console;
+        console.puts("[IPC] No sender, blocking receiver\n");
         if (scheduler.getCurrent()) |cur| {
             ep.waiting_receiver = cur;
         }
         ep.receiver_buf = msg;
+        // Mark as blocked - the actual reschedule happens when syscall returns
+        // We need to check if a message arrived after we're unblocked
         scheduler.blockCurrent(.blocked_ipc);
-        // When we wake up, the message has been copied to msg
+        // When we return here, the sender should have filled our message buffer
+        console.puts("[IPC] Receiver unblocked\n");
         ep.receiver_buf = null;
     }
 }
 
-/// Non-blocking receive
-pub fn tryReceive(from: EndpointId, msg: *Message) IpcError!bool {
-    if (!initialized) return IpcError.InvalidEndpoint;
+/// Result of tryReceive operation
+pub const TryReceiveResult = enum(u8) {
+    got_message = 0,
+    no_message = 1,
+    invalid_endpoint = 2,
+    endpoint_closed = 3,
+};
+
+/// Non-blocking receive - returns simple enum to avoid error union issues
+pub fn tryReceive(from: EndpointId, msg: *Message) TryReceiveResult {
+    if (!initialized) return .invalid_endpoint;
 
     const idx = from.raw();
-    if (idx >= MAX_ENDPOINTS) return IpcError.InvalidEndpoint;
+    if (idx >= MAX_ENDPOINTS) return .invalid_endpoint;
 
     const ep = &endpoints[idx];
-    if (ep.state != .active) return IpcError.EndpointClosed;
+    if (ep.state != .active) return .endpoint_closed;
 
     // Check for pending notification
     if (ep.notification_pending) {
-        msg.* = Message.init(0);
+        clearMessage(msg);
         msg.badge = ep.notification_badge;
         ep.notification_pending = false;
-        return true;
+        return .got_message;
     }
 
     // Check if there's a waiting sender with a message
     if (ep.waiting_sender) |sender| {
         if (ep.has_pending_msg) {
-            msg.* = ep.pending_msg;
+            copyMessage(msg, &ep.pending_msg);
             ep.has_pending_msg = false;
             ep.waiting_sender = null;
             scheduler.unblock(sender);
-            return true;
+            return .got_message;
         }
     }
 
-    return false;
+    return .no_message;
+}
+
+/// Register current thread as waiting receiver on an endpoint
+/// This is called when tryReceive returns false, to set up for later wakeup
+/// The frame pointer is used to set return values directly when message arrives
+pub fn registerWaitingReceiver(from: EndpointId, msg: *Message, frame: ?*SyscallFrame) void {
+    const idx = from.raw();
+    if (idx >= MAX_ENDPOINTS) return;
+
+    const ep = &endpoints[idx];
+    if (ep.state != .active) return;
+
+    if (scheduler.getCurrent()) |cur| {
+        ep.waiting_receiver = cur;
+    }
+    ep.receiver_buf = msg;
+    ep.receiver_frame = frame;
 }
 
 /// Send a notification (non-blocking, fire-and-forget)
