@@ -82,6 +82,11 @@ pub const Thread = struct {
 
     // True if thread hasn't started executing yet
     first_run: bool,
+
+    // Userspace support (EL0)
+    is_user: bool, // True if this runs in EL0 (userspace)
+    user_sp: u64, // User stack pointer (SP_EL0)
+    kernel_sp: u64, // Kernel stack for syscall/exception handling
 };
 
 /// Process Control Block
@@ -123,6 +128,9 @@ var threads: [MAX_THREADS]Thread = [_]Thread{Thread{
     .prev = null,
     .process = null,
     .first_run = false,
+    .is_user = false,
+    .user_sp = 0,
+    .kernel_sp = 0,
 }} ** MAX_THREADS;
 var thread_used: [MAX_THREADS]bool = [_]bool{false} ** MAX_THREADS;
 
@@ -236,7 +244,7 @@ fn freeThread(thread: *Thread) void {
     }
 }
 
-/// Create a new kernel thread
+/// Create a new kernel thread (runs in EL1 - full kernel privileges)
 pub fn createKernelThread(entry: *const fn () void, priority: Priority) ?*Thread {
     const thread = allocThread() orelse return null;
 
@@ -259,9 +267,60 @@ pub fn createKernelThread(entry: *const fn () void, priority: Priority) ?*Thread
     thread.prev = null;
     thread.process = null;
     thread.first_run = true;
+    thread.is_user = false;
+    thread.user_sp = 0;
+    thread.kernel_sp = 0;
 
     // Initialize CPU context for first execution
     context.initContext(&thread.context, @intFromPtr(entry), stack_top);
+
+    next_tid += 1;
+
+    // Add to ready queue
+    enqueue(thread);
+
+    return thread;
+}
+
+/// Create a new user thread (runs in EL0 - restricted userspace)
+/// Entry function runs with limited privileges - must use syscalls for kernel services
+pub fn createUserThread(entry: *const fn () void, priority: Priority) ?*Thread {
+    const thread = allocThread() orelse return null;
+
+    // Allocate USER stack (where the thread runs)
+    const user_stack_base = memory.allocFrame() orelse {
+        freeThread(thread);
+        return null;
+    };
+    const user_stack_top = user_stack_base + KERNEL_STACK_SIZE;
+
+    // Allocate KERNEL stack (for handling syscalls/exceptions)
+    const kernel_stack_base = memory.allocFrame() orelse {
+        memory.freeFrame(user_stack_base);
+        freeThread(thread);
+        return null;
+    };
+    const kernel_stack_top = kernel_stack_base + KERNEL_STACK_SIZE;
+
+    // Initialize thread fields
+    thread.tid = next_tid;
+    thread.state = .ready;
+    thread.priority = priority;
+    thread.time_slice = getTimeSlice(priority);
+    thread.total_runtime = 0;
+    thread.stack_base = user_stack_base;
+    thread.stack_size = KERNEL_STACK_SIZE;
+    thread.next = null;
+    thread.prev = null;
+    thread.process = null;
+    thread.first_run = true;
+    thread.is_user = true;
+    thread.user_sp = user_stack_top;
+    thread.kernel_sp = kernel_stack_top;
+
+    // Initialize CPU context - entry point and kernel stack
+    // The actual EL0 drop happens via ERET in context switch
+    context.initUserContext(&thread.context, @intFromPtr(entry), kernel_stack_top, user_stack_top);
 
     next_tid += 1;
 
@@ -339,6 +398,14 @@ pub fn schedule() void {
             }
             thread.next = null;
 
+            console.puts(console.Color.dim);
+            console.puts("[SCHED] Picking TID ");
+            console.putDec(thread.tid);
+            console.puts(" from queue ");
+            console.putDec(@as(u32, @truncate(qi)));
+            console.newline();
+            console.puts(console.Color.reset);
+
             // Switch to it
             switchTo(thread);
             return;
@@ -346,6 +413,9 @@ pub fn schedule() void {
     }
 
     // Nothing ready - run idle
+    console.puts(console.Color.dim);
+    console.puts("[SCHED] No ready threads, going idle\n");
+    console.puts(console.Color.reset);
     switchTo(idle_thread);
 }
 
@@ -361,12 +431,36 @@ fn switchTo(thread: *Thread) void {
 
     if (old) |o| {
         if (thread.first_run) {
-            // First time running this thread - save old, then start new
+            // First time running this thread
             thread.first_run = false;
-            context.switchToNewInline(&o.context, &thread.context);
+
+            if (thread.is_user) {
+                // User thread: drop to EL0 via ERET
+                console.puts(console.Color.cyan);
+                console.puts("[SCHED] Dropping TID ");
+                console.putDec(thread.tid);
+                console.puts(" to EL0: pc=0x");
+                console.putHex(thread.context.pc);
+                console.puts(" usp=0x");
+                console.putHex(thread.user_sp);
+                console.newline();
+                console.puts(console.Color.reset);
+
+                context.startUserThreadInline(
+                    &o.context,
+                    thread.context.pc, // Entry point
+                    thread.user_sp, // User stack (SP_EL0)
+                    thread.kernel_sp, // Kernel stack (SP_EL1)
+                );
+            } else {
+                // Kernel thread: normal branch to entry
+                context.switchToNewInline(&o.context, &thread.context);
+            }
             // Returns here when old thread is scheduled again (via switchContext)
         } else {
             // Normal context switch - save old, restore new
+            // This works for both kernel and user threads (user threads save
+            // their state in exception handlers before getting here)
             context.switchContext(&o.context, &thread.context);
             // Returns here when old thread is scheduled again
         }
@@ -392,8 +486,22 @@ pub fn yield() void {
 /// Block current thread
 pub fn blockCurrent(reason: State) void {
     if (current) |c| {
+        console.puts(console.Color.yellow);
+        console.puts("[SCHED] Blocking TID ");
+        console.putDec(c.tid);
+        console.puts(" reason=");
+        console.putDec(@intFromEnum(reason));
+        console.newline();
+        console.puts(console.Color.reset);
+
         c.state = reason;
         schedule();
+
+        console.puts(console.Color.yellow);
+        console.puts("[SCHED] TID ");
+        console.putDec(c.tid);
+        console.puts(" resumed\n");
+        console.puts(console.Color.reset);
     }
 }
 
@@ -433,9 +541,16 @@ pub fn timerTick() void {
 }
 
 /// Check if reschedule is needed (called after returning from interrupt)
+/// This puts the current thread back in the ready queue before scheduling
 pub fn checkReschedule() void {
     if (need_reschedule) {
         need_reschedule = false;
+        // Put current thread back in ready queue (unless it's idle or blocked)
+        if (current) |c| {
+            if (c != idle_thread and c.state == .running) {
+                enqueue(c);
+            }
+        }
         schedule();
     }
 }

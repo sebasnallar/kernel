@@ -191,68 +191,117 @@ pub fn panic(msg: []const u8) noreturn {
 // Test Threads
 // ============================================================
 
-/// Create test threads to verify scheduling
+/// Create test threads to verify userspace execution
 fn createTestThreads() void {
-    if (scheduler.createKernelThread(&threadA, .normal)) |t| {
+    // Create USERSPACE threads - they run in EL0 with restricted privileges
+    if (scheduler.createUserThread(&threadA, .normal)) |t| {
         console.puts("  Thread A created (TID ");
         console.putDec(t.tid);
-        console.puts(")\n");
+        console.puts(") - ");
+        console.puts(console.Color.green);
+        console.puts("USERSPACE (EL0)\n");
+        console.puts(console.Color.reset);
     } else {
         console.status("Thread A creation", false);
     }
 
-    if (scheduler.createKernelThread(&threadB, .normal)) |t| {
+    if (scheduler.createUserThread(&threadB, .normal)) |t| {
         console.puts("  Thread B created (TID ");
         console.putDec(t.tid);
-        console.puts(")\n");
+        console.puts(") - ");
+        console.puts(console.Color.green);
+        console.puts("USERSPACE (EL0)\n");
+        console.puts(console.Color.reset);
     } else {
         console.status("Thread B creation", false);
     }
 
-    console.status("Test threads ready", true);
+    console.status("Userspace threads ready", true);
 }
 
 // Global counters to avoid register/stack issues during context switch
 var thread_a_counter: u32 = 0;
 var thread_b_counter: u32 = 0;
 
-/// Test thread A - prints periodically
+const syscall = root.syscall;
+
+// Shared endpoint ID for IPC communication (created by thread B)
+var ipc_endpoint: u32 = 0;
+var endpoint_ready: bool = false;
+
+// Static message buffer for thread A (avoid stack issues)
+var thread_a_msg_buf: ipc.Message = .{};
+
+// Volatile read/write helpers to ensure visibility across threads
+fn readEndpointReady() bool {
+    const ptr: *volatile bool = @ptrCast(&endpoint_ready);
+    return ptr.*;
+}
+
+fn writeEndpointReady(val: bool) void {
+    const ptr: *volatile bool = @ptrCast(&endpoint_ready);
+    ptr.* = val;
+}
+
+/// Test thread A - userspace sender
 fn threadA() void {
+    // Wait for endpoint to be ready (busy wait, no syscall needed)
+    while (!readEndpointReady()) {
+        // Busy wait - could use syscall.yield() but let's test simple first
+        var i: u32 = 0;
+        while (i < 100000) : (i += 1) {
+            asm volatile ("nop");
+        }
+    }
+
+    // Now use syscalls for everything
     while (true) {
-        thread_a_counter += 1;
-        console.puts(console.Color.cyan);
-        console.puts("[A:");
-        console.putDec(thread_a_counter);
-        console.puts("] ");
-        console.puts(console.Color.reset);
+        thread_a_counter +%= 1;
 
-        // Busy wait to slow things down
-        busyWait(500000);
+        // Build message using static buffer
+        thread_a_msg_buf.op = thread_a_counter;
+        thread_a_msg_buf.arg0 = 0;
+        thread_a_msg_buf.arg1 = 0;
+        thread_a_msg_buf.arg2 = 0;
+        thread_a_msg_buf.arg3 = 0;
 
-        // Voluntarily yield after a few iterations
-        if (thread_a_counter % 5 == 0) {
-            scheduler.yield();
+        // Send via syscall (this is the ONLY way to do IPC from EL0)
+        _ = syscall.syscall2(syscall.SYS.SEND, ipc_endpoint, thread_a_counter);
+
+        // Small delay
+        var i: u32 = 0;
+        while (i < 500000) : (i += 1) {
+            asm volatile ("nop");
         }
     }
 }
 
-/// Test thread B - prints periodically
+// Static message buffer for thread B (avoid potential stack issues)
+var thread_b_msg_buf: ipc.Message = .{};
+
+/// Test thread B - userspace receiver
 fn threadB() void {
-    while (true) {
-        thread_b_counter += 1;
-        console.puts(console.Color.yellow);
-        console.puts("[B:");
-        console.putDec(thread_b_counter);
-        console.puts("] ");
-        console.puts(console.Color.reset);
-
-        // Busy wait to slow things down
-        busyWait(500000);
-
-        // Voluntarily yield after a few iterations
-        if (thread_b_counter % 5 == 0) {
-            scheduler.yield();
+    // Create endpoint via syscall
+    const ep_result = syscall.syscall0(syscall.SYS.PORT_CREATE);
+    if (ep_result < 0) {
+        // Failed - just loop
+        while (true) {
+            asm volatile ("nop");
         }
+    }
+
+    ipc_endpoint = @intCast(@as(u64, @bitCast(ep_result)));
+    writeEndpointReady(true);
+
+    // Receive loop via syscalls
+    while (true) {
+        thread_b_counter +%= 1;
+
+        // Receive via syscall
+        const recv_result = syscall.syscall1(syscall.SYS.RECV, ipc_endpoint);
+        _ = recv_result;
+
+        // Got a message! Just continue
     }
 }
 

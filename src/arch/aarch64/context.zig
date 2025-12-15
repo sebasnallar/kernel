@@ -119,7 +119,7 @@ pub inline fn switchToNewInline(old_ctx: *scheduler.CpuContext, new_ctx: *const 
     );
 }
 
-/// Initialize a thread's context for first execution
+/// Initialize a thread's context for first execution (kernel thread - EL1)
 /// Sets up the context so that when the thread is switched to,
 /// it starts executing at the entry point with the given stack.
 pub fn initContext(ctx: *scheduler.CpuContext, entry: u64, stack_top: u64) void {
@@ -138,6 +138,107 @@ pub fn initContext(ctx: *scheduler.CpuContext, entry: u64, stack_top: u64) void 
     ctx.x30 = @intFromPtr(&threadExit); // Return address -> cleanup
     ctx.sp = stack_top;
     ctx.pc = entry;
+}
+
+/// Initialize a user thread's context for first execution (EL0)
+/// The thread will drop to EL0 via ERET when first scheduled.
+pub fn initUserContext(ctx: *scheduler.CpuContext, entry: u64, kernel_sp: u64, user_sp: u64) void {
+    // Zero all callee-saved registers
+    ctx.x19 = 0;
+    ctx.x20 = 0;
+    ctx.x21 = 0;
+    ctx.x22 = 0;
+    ctx.x23 = 0;
+    ctx.x24 = 0;
+    ctx.x25 = 0;
+    ctx.x26 = 0;
+    ctx.x27 = 0;
+    ctx.x28 = 0;
+    ctx.x29 = 0; // Frame pointer
+    ctx.x30 = 0; // Not used - we ERET to entry point
+    ctx.sp = kernel_sp; // Kernel stack (SP_EL1 for exception handling)
+    ctx.pc = entry; // Entry point in user code
+
+    // Store user_sp in x19 temporarily - will be loaded into SP_EL0 before ERET
+    ctx.x19 = user_sp;
+}
+
+/// Start a user thread for the first time - drops to EL0 via ERET
+/// This saves the old context and then ERets to the new user thread.
+/// old_ctx: kernel context to save (so we can return to scheduler)
+/// entry: user code entry point
+/// user_sp: user stack pointer (SP_EL0)
+/// kernel_sp: kernel stack for this thread (SP_EL1)
+pub inline fn startUserThreadInline(
+    old_ctx: *scheduler.CpuContext,
+    entry: u64,
+    user_sp: u64,
+    kernel_sp: u64,
+) void {
+    asm volatile (
+        // Save current (kernel) thread's callee-saved registers
+        \\stp x19, x20, [%[old], #0]
+        \\stp x21, x22, [%[old], #16]
+        \\stp x23, x24, [%[old], #32]
+        \\stp x25, x26, [%[old], #48]
+        \\stp x27, x28, [%[old], #64]
+        \\str x29, [%[old], #80]
+        // Save resume address
+        \\adr x2, .Lresume_from_user
+        \\str x2, [%[old], #88]
+        \\mov x2, sp
+        \\str x2, [%[old], #96]
+        \\
+        // Set up for EL0 entry
+        // Set kernel stack (SP_EL1) - this is where exceptions will use
+        \\mov sp, %[ksp]
+        \\
+        // Set user stack (SP_EL0)
+        \\msr sp_el0, %[usp]
+        \\
+        // Set return address for ERET (ELR_EL1)
+        \\msr elr_el1, %[entry]
+        \\
+        // Set SPSR_EL1 for EL0t (bits 3:0 = 0 for EL0)
+        // Enable interrupts (clear I bit = bit 7, clear F bit = bit 6)
+        \\mov x2, #0
+        \\msr spsr_el1, x2
+        \\
+        // Clear user-visible registers for clean start
+        \\mov x0, #0
+        \\mov x1, #0
+        \\mov x2, #0
+        \\mov x3, #0
+        \\mov x4, #0
+        \\mov x5, #0
+        \\mov x6, #0
+        \\mov x7, #0
+        \\mov x8, #0
+        \\mov x9, #0
+        \\mov x10, #0
+        \\mov x11, #0
+        \\mov x12, #0
+        \\mov x13, #0
+        \\mov x14, #0
+        \\mov x15, #0
+        \\mov x16, #0
+        \\mov x17, #0
+        \\mov x18, #0
+        \\mov x29, #0
+        \\mov x30, #0
+        \\
+        // Drop to EL0!
+        \\eret
+        \\
+        \\.Lresume_from_user:
+        // When this thread is switched back (after being preempted), we resume here
+        :
+        : [old] "r" (old_ctx),
+          [entry] "r" (entry),
+          [usp] "r" (user_sp),
+          [ksp] "r" (kernel_sp),
+        : "x2", "memory"
+    );
 }
 
 /// Called when a thread's entry function returns

@@ -99,10 +99,24 @@ pub const SyscallFrame = struct {
 // System Call Dispatcher
 // ============================================================
 
+var syscall_total: u32 = 0;
+
 /// Main syscall dispatcher - called from exception handler
 /// Returns the result in frame.x0
 pub fn dispatch(frame: *SyscallFrame) void {
     const syscall_num = frame.x8;
+
+    syscall_total += 1;
+    if (syscall_total <= 10 or syscall_total % 100 == 0) {
+        console.puts(console.Color.yellow);
+        console.puts("[SYS] #");
+        console.putDec(syscall_total);
+        console.puts(" num=");
+        console.putDec(@as(u32, @truncate(syscall_num)));
+        console.newline();
+        console.puts(console.Color.reset);
+    }
+
     const result: i64 = switch (syscall_num) {
         // Process/Thread control
         SYS.EXIT => sysExit(frame),
@@ -170,6 +184,12 @@ fn sysGetTid() i64 {
     return 0;
 }
 
+const console = root.console;
+
+// Debug counter for syscall activity
+var send_count: u32 = 0;
+var recv_count: u32 = 0;
+
 /// Send message to a port
 /// x0 = port_id, x1 = op, x2 = arg0, x3 = arg1
 fn sysSend(frame: *SyscallFrame) i64 {
@@ -190,8 +210,22 @@ fn sysSend(frame: *SyscallFrame) i64 {
             else => @intFromEnum(Error.INVALID_ARGUMENT),
         };
     };
+
+    send_count += 1;
+    if (send_count % 10 == 1) {
+        console.puts(console.Color.cyan);
+        console.puts("[KERN] Send #");
+        console.putDec(send_count);
+        console.puts(" op=");
+        console.putDec(op);
+        console.newline();
+        console.puts(console.Color.reset);
+    }
     return 0;
 }
+
+// Static buffer for receive (avoid stack issues)
+var recv_msg_buf: ipc.Message = .{};
 
 /// Receive message from a port
 /// x0 = port_id, returns: x0 = op, x1 = arg0, x2 = arg1
@@ -199,9 +233,8 @@ fn sysRecv(frame: *SyscallFrame) i64 {
     const port_id: u32 = @truncate(frame.x0);
     const endpoint = ipc.EndpointId.fromRaw(port_id);
 
-    // Try to receive (blocking)
-    var msg: ipc.Message = undefined;
-    ipc.receive(endpoint, &msg) catch |err| {
+    // Try to receive (blocking) using static buffer
+    ipc.receive(endpoint, &recv_msg_buf) catch |err| {
         return switch (err) {
             ipc.IpcError.InvalidEndpoint => @intFromEnum(Error.INVALID_PORT),
             ipc.IpcError.EndpointClosed => @intFromEnum(Error.INVALID_PORT),
@@ -209,10 +242,21 @@ fn sysRecv(frame: *SyscallFrame) i64 {
         };
     };
 
+    recv_count += 1;
+    if (recv_count % 10 == 1) {
+        console.puts(console.Color.green);
+        console.puts("[KERN] Recv #");
+        console.putDec(recv_count);
+        console.puts(" op=");
+        console.putDec(recv_msg_buf.op);
+        console.newline();
+        console.puts(console.Color.reset);
+    }
+
     // Put results in frame for return
-    frame.x1 = msg.arg0;
-    frame.x2 = msg.arg1;
-    return @intCast(msg.op);
+    frame.x1 = recv_msg_buf.arg0;
+    frame.x2 = recv_msg_buf.arg1;
+    return @intCast(recv_msg_buf.op);
 }
 
 /// Send and wait for reply (RPC style)
@@ -251,7 +295,6 @@ fn sysPortDestroy(frame: *SyscallFrame) i64 {
 /// Debug print (for kernel threads)
 /// x0 = string pointer, x1 = length
 fn sysDebugPrint(frame: *SyscallFrame) i64 {
-    const console = root.console;
     const ptr: [*]const u8 = @ptrFromInt(frame.x0);
     const len: usize = @truncate(frame.x1);
 

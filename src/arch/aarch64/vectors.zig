@@ -23,6 +23,8 @@ pub fn install() void {
         }
     }.f;
 
+    // === EL1h vectors (exceptions while in kernel mode) ===
+
     // Patch Sync vector (at offset 0x200) to branch to syncEntry
     const sync_handler_addr = @intFromPtr(&syncEntry);
     const sync_vector_addr = vbar + 0x200;
@@ -33,9 +35,35 @@ pub fn install() void {
     const irq_handler_addr = @intFromPtr(&irqEntry);
     const irq_vector_addr = vbar + 0x280;
     const b_inst = encodeB(irq_vector_addr, irq_handler_addr);
-
-    // Write the branch instruction at the IRQ vector entry
     table_ptr[0x280 / 4] = b_inst;
+
+    // === EL0 64-bit vectors (exceptions from userspace) ===
+
+    // Patch EL0 Sync vector (at offset 0x400) - syscalls from userspace
+    const el0_sync_handler_addr = @intFromPtr(&el0SyncEntry);
+    const el0_sync_vector_addr = vbar + 0x400;
+    const el0_sync_b_inst = encodeB(el0_sync_vector_addr, el0_sync_handler_addr);
+    table_ptr[0x400 / 4] = el0_sync_b_inst;
+
+    console.puts("  EL0 Sync vector: 0x");
+    console.putHex(el0_sync_vector_addr);
+    console.puts(" -> 0x");
+    console.putHex(el0_sync_handler_addr);
+    console.puts(" (inst=0x");
+    console.putHex(el0_sync_b_inst);
+    console.puts(")\n");
+
+    // Patch EL0 IRQ vector (at offset 0x480) - interrupts while in userspace
+    const el0_irq_handler_addr = @intFromPtr(&el0IrqEntry);
+    const el0_irq_vector_addr = vbar + 0x480;
+    const el0_irq_b_inst = encodeB(el0_irq_vector_addr, el0_irq_handler_addr);
+    table_ptr[0x480 / 4] = el0_irq_b_inst;
+
+    console.puts("  EL0 IRQ vector: 0x");
+    console.putHex(el0_irq_vector_addr);
+    console.puts(" -> 0x");
+    console.putHex(el0_irq_handler_addr);
+    console.puts("\n");
 
     // Ensure write is visible
     asm volatile ("dsb sy");
@@ -199,48 +227,50 @@ export fn handleIrqWrapper() callconv(.C) void {
 // Sync exception handler (for SVC/syscalls)
 pub fn syncEntry() callconv(.Naked) void {
     asm volatile (
-        // Save all caller-saved registers + syscall args
-        \\stp x0, x1, [sp, #-16]!
-        \\stp x2, x3, [sp, #-16]!
-        \\stp x4, x5, [sp, #-16]!
-        \\stp x6, x7, [sp, #-16]!
-        \\stp x8, x9, [sp, #-16]!
-        \\stp x10, x11, [sp, #-16]!
-        \\stp x12, x13, [sp, #-16]!
-        \\stp x14, x15, [sp, #-16]!
-        \\stp x16, x17, [sp, #-16]!
-        \\stp x18, x30, [sp, #-16]!
-        \\
-        // Save ELR_EL1 and SPSR_EL1
+        // Allocate frame and save registers in struct order
+        // SyscallFrame: x0-x7, x8-x17, x18, x30, elr, spsr (22 * 8 = 176 bytes)
+        \\sub sp, sp, #176
+        \\stp x0, x1, [sp, #0]
+        \\stp x2, x3, [sp, #16]
+        \\stp x4, x5, [sp, #32]
+        \\stp x6, x7, [sp, #48]
+        \\stp x8, x9, [sp, #64]
+        \\stp x10, x11, [sp, #80]
+        \\stp x12, x13, [sp, #96]
+        \\stp x14, x15, [sp, #112]
+        \\stp x16, x17, [sp, #128]
+        \\stp x18, x30, [sp, #144]
         \\mrs x0, elr_el1
         \\mrs x1, spsr_el1
-        \\stp x0, x1, [sp, #-16]!
+        \\stp x0, x1, [sp, #160]
         \\
         // Pass frame pointer to handler
         \\mov x0, sp
         \\bl handleSyncWrapper
         \\
         // Restore ELR_EL1 and SPSR_EL1
-        \\ldp x0, x1, [sp], #16
+        \\ldp x0, x1, [sp, #160]
         \\msr elr_el1, x0
         \\msr spsr_el1, x1
         \\
-        // Restore registers (x0 contains return value from syscall)
-        \\ldp x18, x30, [sp], #16
-        \\ldp x16, x17, [sp], #16
-        \\ldp x14, x15, [sp], #16
-        \\ldp x12, x13, [sp], #16
-        \\ldp x10, x11, [sp], #16
-        \\ldp x8, x9, [sp], #16
-        \\ldp x6, x7, [sp], #16
-        \\ldp x4, x5, [sp], #16
-        \\ldp x2, x3, [sp], #16
-        \\ldp x0, x1, [sp], #16
+        // Restore registers (x0 may have been modified by syscall return value)
+        \\ldp x18, x30, [sp, #144]
+        \\ldp x16, x17, [sp, #128]
+        \\ldp x14, x15, [sp, #112]
+        \\ldp x12, x13, [sp, #96]
+        \\ldp x10, x11, [sp, #80]
+        \\ldp x8, x9, [sp, #64]
+        \\ldp x6, x7, [sp, #48]
+        \\ldp x4, x5, [sp, #32]
+        \\ldp x2, x3, [sp, #16]
+        \\ldp x0, x1, [sp, #0]
+        \\add sp, sp, #176
         \\eret
     );
 }
 
 const syscall = root.syscall;
+const scheduler = root.scheduler;
 
 export fn handleSyncWrapper(frame: *syscall.SyscallFrame) callconv(.C) void {
     // Read ESR to determine exception type
@@ -260,4 +290,221 @@ export fn handleSyncWrapper(frame: *syscall.SyscallFrame) callconv(.C) void {
         // Other sync exception - for now just return
         // TODO: Handle page faults, undefined instructions, etc.
     }
+}
+
+// ============================================================
+// EL0 Exception Handlers (exceptions from userspace)
+// ============================================================
+
+/// EL0 Sync handler - handles syscalls from userspace
+/// When entering from EL0, we're automatically on SP_EL1 (kernel stack)
+pub fn el0SyncEntry() callconv(.Naked) void {
+    asm volatile (
+        // We're on kernel stack (SP_EL1). Save user state.
+        // Allocate frame: x0-x30, sp_el0, elr, spsr = 34 * 8 = 272 bytes
+        // But we'll use same SyscallFrame layout for compatibility (176 bytes)
+        // and save SP_EL0 separately
+        \\sub sp, sp, #192
+        \\stp x0, x1, [sp, #0]
+        \\stp x2, x3, [sp, #16]
+        \\stp x4, x5, [sp, #32]
+        \\stp x6, x7, [sp, #48]
+        \\stp x8, x9, [sp, #64]
+        \\stp x10, x11, [sp, #80]
+        \\stp x12, x13, [sp, #96]
+        \\stp x14, x15, [sp, #112]
+        \\stp x16, x17, [sp, #128]
+        \\stp x18, x30, [sp, #144]
+        \\mrs x0, elr_el1
+        \\mrs x1, spsr_el1
+        \\stp x0, x1, [sp, #160]
+        // Save SP_EL0 (user stack pointer)
+        \\mrs x0, sp_el0
+        \\str x0, [sp, #176]
+        \\
+        // Pass frame pointer to handler
+        \\mov x0, sp
+        \\bl handleEl0SyncWrapper
+        \\
+        // Restore SP_EL0
+        \\ldr x0, [sp, #176]
+        \\msr sp_el0, x0
+        // Restore ELR_EL1 and SPSR_EL1
+        \\ldp x0, x1, [sp, #160]
+        \\msr elr_el1, x0
+        \\msr spsr_el1, x1
+        \\
+        // Restore user registers
+        \\ldp x18, x30, [sp, #144]
+        \\ldp x16, x17, [sp, #128]
+        \\ldp x14, x15, [sp, #112]
+        \\ldp x12, x13, [sp, #96]
+        \\ldp x10, x11, [sp, #80]
+        \\ldp x8, x9, [sp, #64]
+        \\ldp x6, x7, [sp, #48]
+        \\ldp x4, x5, [sp, #32]
+        \\ldp x2, x3, [sp, #16]
+        \\ldp x0, x1, [sp, #0]
+        \\add sp, sp, #192
+        \\eret
+    );
+}
+
+/// Extended frame for EL0 exceptions (includes SP_EL0)
+pub const El0Frame = struct {
+    // Same as SyscallFrame
+    x0: u64,
+    x1: u64,
+    x2: u64,
+    x3: u64,
+    x4: u64,
+    x5: u64,
+    x6: u64,
+    x7: u64,
+    x8: u64,
+    x9: u64,
+    x10: u64,
+    x11: u64,
+    x12: u64,
+    x13: u64,
+    x14: u64,
+    x15: u64,
+    x16: u64,
+    x17: u64,
+    x18: u64,
+    x30: u64,
+    elr: u64,
+    spsr: u64,
+    // Extra: user stack pointer
+    sp_el0: u64,
+};
+
+var el0_sync_count: u32 = 0;
+
+export fn handleEl0SyncWrapper(frame: *El0Frame) callconv(.C) void {
+    el0_sync_count += 1;
+    if (el0_sync_count <= 5) {
+        console.puts(console.Color.magenta);
+        console.puts("[EL0-SYNC] Entry #");
+        console.putDec(el0_sync_count);
+        console.puts(" x8=");
+        console.putDec(@as(u32, @truncate(frame.x8)));
+        console.newline();
+        console.puts(console.Color.reset);
+    }
+
+    // Read ESR to determine exception type
+    var esr: u64 = undefined;
+    asm volatile ("mrs %[esr], esr_el1"
+        : [esr] "=r" (esr),
+    );
+
+    // Extract exception class (bits 31:26)
+    const ec = (esr >> 26) & 0x3F;
+
+    if (el0_sync_count <= 5) {
+        console.puts(console.Color.magenta);
+        console.puts("  EC=0x");
+        console.putHex(ec);
+        console.newline();
+        console.puts(console.Color.reset);
+    }
+
+    // EC 0x15 = SVC instruction (64-bit)
+    if (ec == 0x15) {
+        // This is a syscall from userspace - dispatch it
+        // Cast to SyscallFrame (same layout for first 22 fields)
+        const syscall_frame: *syscall.SyscallFrame = @ptrCast(frame);
+        syscall.dispatch(syscall_frame);
+    } else {
+        // Other sync exception from userspace
+        console.puts(console.Color.red);
+        console.puts("[EL0] Sync EC=");
+        console.putHex(ec);
+        console.puts(" ESR=");
+        console.putHex(esr);
+        console.puts(" ELR=");
+        console.putHex(frame.elr);
+        console.puts(" FAR=");
+        // Read FAR_EL1 (fault address register)
+        var far: u64 = undefined;
+        asm volatile ("mrs %[far], far_el1"
+            : [far] "=r" (far),
+        );
+        console.putHex(far);
+        console.newline();
+        console.puts(console.Color.reset);
+    }
+}
+
+/// EL0 IRQ handler - handles interrupts while in userspace
+/// This is critical for preemption of user threads
+pub fn el0IrqEntry() callconv(.Naked) void {
+    asm volatile (
+        // We're on kernel stack (SP_EL1). Save ALL user state.
+        // This is important because we might context switch away
+        \\sub sp, sp, #192
+        \\stp x0, x1, [sp, #0]
+        \\stp x2, x3, [sp, #16]
+        \\stp x4, x5, [sp, #32]
+        \\stp x6, x7, [sp, #48]
+        \\stp x8, x9, [sp, #64]
+        \\stp x10, x11, [sp, #80]
+        \\stp x12, x13, [sp, #96]
+        \\stp x14, x15, [sp, #112]
+        \\stp x16, x17, [sp, #128]
+        \\stp x18, x30, [sp, #144]
+        \\mrs x0, elr_el1
+        \\mrs x1, spsr_el1
+        \\stp x0, x1, [sp, #160]
+        // Save SP_EL0 (user stack pointer)
+        \\mrs x0, sp_el0
+        \\str x0, [sp, #176]
+        \\
+        // Call the IRQ handler
+        \\bl handleEl0IrqWrapper
+        \\
+        // Restore SP_EL0
+        \\ldr x0, [sp, #176]
+        \\msr sp_el0, x0
+        // Restore ELR_EL1 and SPSR_EL1
+        \\ldp x0, x1, [sp, #160]
+        \\msr elr_el1, x0
+        \\msr spsr_el1, x1
+        \\
+        // Restore user registers
+        \\ldp x18, x30, [sp, #144]
+        \\ldp x16, x17, [sp, #128]
+        \\ldp x14, x15, [sp, #112]
+        \\ldp x12, x13, [sp, #96]
+        \\ldp x10, x11, [sp, #80]
+        \\ldp x8, x9, [sp, #64]
+        \\ldp x6, x7, [sp, #48]
+        \\ldp x4, x5, [sp, #32]
+        \\ldp x2, x3, [sp, #16]
+        \\ldp x0, x1, [sp, #0]
+        \\add sp, sp, #192
+        \\eret
+    );
+}
+
+var el0_irq_count: u32 = 0;
+
+export fn handleEl0IrqWrapper() callconv(.C) void {
+    el0_irq_count += 1;
+    if (el0_irq_count <= 5) {
+        console.puts(console.Color.blue);
+        console.puts("[EL0-IRQ] #");
+        console.putDec(el0_irq_count);
+        console.newline();
+        console.puts(console.Color.reset);
+    }
+
+    // Handle the interrupt (same as kernel mode)
+    interrupt.handleIrq();
+
+    // After IRQ handling, check if we need to reschedule
+    // For user threads, we need to yield here to allow preemption
+    // The user's state is already saved on the kernel stack by el0IrqEntry
+    scheduler.checkReschedule();
 }
