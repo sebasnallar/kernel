@@ -63,6 +63,28 @@ pub fn build(b: *std.Build) void {
     const install_init = b.addInstallBinFile(init_mkbin.getOutput(), "init.mlk");
     b.default_step.dependOn(&install_init.step);
 
+    // Build console server
+    const console_srv = b.addExecutable(.{
+        .name = "console",
+        .root_source_file = b.path("user/console.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .pic = true,
+    });
+    console_srv.setLinkerScript(b.path("user/user.ld"));
+    console_srv.root_module.stack_protector = false;
+    console_srv.root_module.link_libc = false;
+
+    const console_bin = console_srv.addObjCopy(.{
+        .basename = "console.bin",
+        .format = .bin,
+    });
+
+    const console_mkbin = MkBinStep.create(b, console_bin.getOutput(), "console.mlk");
+    const install_console = b.addInstallBinFile(console_mkbin.getOutput(), "console.mlk");
+    b.default_step.dependOn(&install_console.step);
+
     // ============================================================
     // Kernel
     // ============================================================
@@ -88,8 +110,10 @@ pub fn build(b: *std.Build) void {
     // Make MLK binaries available for @embedFile
     const write_hello = WriteFileStep.create(b, mkbin_step.getOutput(), "src/embedded/hello.mlk");
     const write_init = WriteFileStep.create(b, init_mkbin.getOutput(), "src/embedded/init.mlk");
+    const write_console = WriteFileStep.create(b, console_mkbin.getOutput(), "src/embedded/console.mlk");
     kernel.step.dependOn(&write_hello.step);
     kernel.step.dependOn(&write_init.step);
+    kernel.step.dependOn(&write_console.step);
 
     // Install the kernel binary
     b.installArtifact(kernel);

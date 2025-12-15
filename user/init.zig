@@ -1,6 +1,7 @@
 // MyLittleKernel - Init Process
 //
-// The first user process. Spawns child processes and manages them.
+// The first user process. Spawns system services and manages them.
+// Following microkernel philosophy: init spawns servers, not the kernel.
 
 const SYS = struct {
     const EXIT: u64 = 0;
@@ -10,6 +11,10 @@ const SYS = struct {
     const WAIT: u64 = 5;
     const WRITE: u64 = 40;
 };
+
+// Binary IDs (must match binaries.zig)
+const BINARY_HELLO: u64 = 0;
+const BINARY_CONSOLE: u64 = 2;
 
 fn syscall0(num: u64) i64 {
     var ret: i64 = undefined;
@@ -94,29 +99,46 @@ export fn _start() callconv(.C) noreturn {
     putDec(@bitCast(getpid()));
     write(")\n");
 
-    // Spawn 3 child processes
-    write("[init] Spawning 3 hello processes...\n");
-
-    var pids: [3]i64 = undefined;
-    var i: usize = 0;
-    while (i < 3) : (i += 1) {
-        pids[i] = spawn(0); // binary_id 0 = hello
-        write("[init] Spawned child PID ");
-        if (pids[i] > 0) {
-            putDec(@bitCast(pids[i]));
-        } else {
-            write("ERROR");
-        }
-        write("\n");
+    // Step 1: Spawn console server
+    write("[init] Spawning console server...\n");
+    const console_pid = spawn(BINARY_CONSOLE);
+    if (console_pid > 0) {
+        write("[init] Console server started (PID ");
+        putDec(@bitCast(console_pid));
+        write(")\n");
+    } else {
+        write("[init] Failed to spawn console server!\n");
     }
 
-    // Let children run for a bit
-    write("[init] Letting children run...\n");
-    var loops: u32 = 0;
-    while (loops < 50) : (loops += 1) {
+    // Give console server time to initialize
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
         yield();
     }
 
-    write("[init] Init process exiting\n");
-    exit(0);
+    // Step 2: Spawn application process
+    write("[init] Spawning hello process...\n");
+
+    const hello_pid = spawn(BINARY_HELLO);
+    write("[init] Spawned hello (PID ");
+    if (hello_pid > 0) {
+        putDec(@bitCast(hello_pid));
+    } else {
+        write("ERROR");
+    }
+    write(")\n");
+
+    // Let everything run
+    write("[init] System running. Entering idle loop.\n");
+
+    while (true) {
+        // Check for terminated children
+        const result = wait(-1);
+        if (result >= 0) {
+            write("[init] Child exited with code ");
+            putDec(@bitCast(result));
+            write("\n");
+        }
+        yield();
+    }
 }

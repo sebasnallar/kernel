@@ -226,7 +226,9 @@ fn sysSpawn(frame: *SyscallFrame) i64 {
 
     // Select binary based on ID
     const binary_data: []const u8 = switch (binary_id) {
-        0 => binaries.hello,
+        binaries.BINARY_HELLO => binaries.hello,
+        binaries.BINARY_INIT => binaries.init,
+        binaries.BINARY_CONSOLE => binaries.console,
         else => return @intFromEnum(Error.INVALID_ARGUMENT),
     };
 
