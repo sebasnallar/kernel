@@ -11,6 +11,7 @@ const root = @import("root");
 const console = root.console;
 const boot = root.boot;
 const memory = root.memory;
+const mmu = root.mmu;
 const interrupt = root.interrupt;
 const scheduler = root.scheduler;
 const ipc = root.ipc;
@@ -43,6 +44,10 @@ pub fn init() noreturn {
     // Phase 5: IPC
     console.section("IPC Subsystem");
     initIpc();
+
+    // Phase 6: Virtual Memory (MMU)
+    console.section("Virtual Memory");
+    initMmu();
 
     // Boot complete
     console.newline();
@@ -100,7 +105,12 @@ fn initMemory() void {
     console.newline();
 
     console.status("Physical frame allocator", true);
-    console.status("Page tables (identity mapped)", true);
+}
+
+/// Initialize MMU and virtual memory
+fn initMmu() void {
+    mmu.init();
+    console.status("MMU enabled", mmu.isInitialized());
 }
 
 /// Set up exception vectors

@@ -5,6 +5,7 @@
 pub const boot = @import("arch/aarch64/boot.zig");
 pub const context = @import("arch/aarch64/context.zig");
 pub const vectors = @import("arch/aarch64/vectors.zig");
+pub const mmu = @import("arch/aarch64/mmu.zig");
 
 // Kernel core
 pub const kernel = @import("kernel/main.zig");

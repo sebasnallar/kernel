@@ -30,6 +30,7 @@ var alloc_base: PhysAddr = 0;
 var alloc_frames: usize = 0;
 var free_frames: usize = 0;
 var initialized: bool = false;
+var search_hint: usize = 0; // Hint for where to start searching
 
 /// Initialize the physical memory allocator
 pub fn init(base: PhysAddr, size: u64) void {
@@ -55,11 +56,14 @@ pub fn init(base: PhysAddr, size: u64) void {
 pub fn allocFrame() ?PhysAddr {
     if (!initialized) return null;
 
-    // Find first free frame
+    // Find first free frame by scanning bytes then bits
     const bitmap_bytes = (alloc_frames + 7) / 8;
-    for (frame_bitmap[0..bitmap_bytes], 0..) |byte, byte_idx| {
+    var byte_idx: usize = 0;
+
+    while (byte_idx < bitmap_bytes) : (byte_idx += 1) {
+        const byte = frame_bitmap[byte_idx];
         if (byte != 0xFF) {
-            // Found a byte with free bit(s)
+            // Found a byte with at least one free bit
             var bit: u3 = 0;
             while (bit < 8) : (bit += 1) {
                 if ((byte & (@as(u8, 1) << bit)) == 0) {
@@ -69,7 +73,6 @@ pub fn allocFrame() ?PhysAddr {
                     // Mark as allocated
                     frame_bitmap[byte_idx] |= (@as(u8, 1) << bit);
                     free_frames -= 1;
-
                     return alloc_base + frame_idx * PAGE_SIZE;
                 }
             }
@@ -97,9 +100,10 @@ pub fn freeFrame(addr: PhysAddr) void {
 }
 
 /// Allocate contiguous physical frames
-pub fn allocContiguous(count: usize) ?PhysAddr {
-    if (!initialized or count == 0) return null;
-    if (count == 1) return allocFrame();
+/// Returns 0 on failure (since physical address 0 is not in usable RAM)
+/// Note: Use this function directly to avoid Zig optional return value codegen issues
+pub fn allocContiguousRaw(count: usize) PhysAddr {
+    if (!initialized or count == 0) return 0;
 
     // First-fit search for contiguous frames
     var start_frame: usize = 0;
@@ -130,7 +134,16 @@ pub fn allocContiguous(count: usize) ?PhysAddr {
             found = 0;
         }
     }
-    return null;
+    return 0;
+}
+
+/// Allocate contiguous physical frames (optional wrapper)
+/// WARNING: Due to a suspected Zig codegen issue with optional returns on ARM64
+/// freestanding, prefer allocContiguousRaw() for new code
+pub fn allocContiguous(count: usize) ?PhysAddr {
+    const result = allocContiguousRaw(count);
+    if (result == 0) return null;
+    return result;
 }
 
 /// Allocate contiguous pages (returns virtual address)
