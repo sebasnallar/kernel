@@ -15,6 +15,8 @@ const mmu = root.mmu;
 const interrupt = root.interrupt;
 const scheduler = root.scheduler;
 const ipc = root.ipc;
+const loader = root.loader;
+const binaries = root.binaries;
 
 // Version information
 pub const VERSION = "0.1.0";
@@ -201,18 +203,23 @@ pub fn panic(msg: []const u8) noreturn {
 // Test Threads
 // ============================================================
 
-/// Create user processes
+/// Create user processes from embedded binaries
 fn createTestThreads() void {
-    const user_program = root.user_program;
-
     console.puts("  Free frames before: ");
     console.putDec(memory.getFreeFrames());
     console.newline();
 
-    // Process A: Prints "[A] " and yields
-    const code_a = user_program.getHelloACode();
-    if (scheduler.createUserProcess(code_a, .normal)) |t| {
-        console.puts("  Process A created (PID ");
+    // Load hello world program from embedded MLK binary
+    console.puts("  Loading hello.mlk (");
+    console.putDec(binaries.hello.len);
+    console.puts(" bytes)...\n");
+
+    // Show binary info
+    loader.printInfo(binaries.hello);
+
+    // Load two instances of the hello program
+    if (loader.loadBinary(binaries.hello, .normal)) |t| {
+        console.puts("  Process 1 created (PID ");
         if (t.process) |p| {
             console.putDec(p.pid);
         }
@@ -222,14 +229,19 @@ fn createTestThreads() void {
         console.puts(console.Color.green);
         console.puts("USER (EL0)\n");
         console.puts(console.Color.reset);
-    } else {
-        console.status("Process A creation", false);
+    } else |err| {
+        console.puts("  Process 1 failed: ");
+        switch (err) {
+            loader.LoadError.InvalidMagic => console.puts("invalid magic\n"),
+            loader.LoadError.InvalidHeader => console.puts("invalid header\n"),
+            loader.LoadError.CodeTooLarge => console.puts("code too large\n"),
+            loader.LoadError.OutOfMemory => console.puts("out of memory\n"),
+            loader.LoadError.ProcessCreationFailed => console.puts("process creation failed\n"),
+        }
     }
 
-    // Process B: Prints "[B] " and yields
-    const code_b = user_program.getHelloBCode();
-    if (scheduler.createUserProcess(code_b, .normal)) |t| {
-        console.puts("  Process B created (PID ");
+    if (loader.loadBinary(binaries.hello, .normal)) |t| {
+        console.puts("  Process 2 created (PID ");
         if (t.process) |p| {
             console.putDec(p.pid);
         }
@@ -239,8 +251,15 @@ fn createTestThreads() void {
         console.puts(console.Color.green);
         console.puts("USER (EL0)\n");
         console.puts(console.Color.reset);
-    } else {
-        console.status("Process B creation", false);
+    } else |err| {
+        console.puts("  Process 2 failed: ");
+        switch (err) {
+            loader.LoadError.InvalidMagic => console.puts("invalid magic\n"),
+            loader.LoadError.InvalidHeader => console.puts("invalid header\n"),
+            loader.LoadError.CodeTooLarge => console.puts("code too large\n"),
+            loader.LoadError.OutOfMemory => console.puts("out of memory\n"),
+            loader.LoadError.ProcessCreationFailed => console.puts("process creation failed\n"),
+        }
     }
 
     console.puts("  Free frames after: ");
