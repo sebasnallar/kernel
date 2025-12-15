@@ -40,6 +40,10 @@ pub const SYS = struct {
     pub const MMAP: u64 = 30; // Map memory
     pub const MUNMAP: u64 = 31; // Unmap memory
 
+    // Console I/O
+    pub const WRITE: u64 = 40; // Write to console (x0=buf, x1=len) -> bytes written
+    pub const READ: u64 = 41; // Read from console (x0=buf, x1=len) -> bytes read
+
     // Debug/Info
     pub const DEBUG_PRINT: u64 = 100; // Print debug message (kernel threads only)
     pub const GET_TICKS: u64 = 101; // Get timer tick count
@@ -125,6 +129,10 @@ pub fn dispatch(frame: *SyscallFrame) void {
         // Port management
         SYS.PORT_CREATE => sysPortCreate(),
         SYS.PORT_DESTROY => sysPortDestroy(frame),
+
+        // Console I/O
+        SYS.WRITE => sysWrite(frame),
+        SYS.READ => sysRead(frame),
 
         // Debug
         SYS.DEBUG_PRINT => sysDebugPrint(frame),
@@ -332,6 +340,72 @@ fn sysDebugPrint(frame: *SyscallFrame) i64 {
 fn sysGetTicks() i64 {
     const interrupt = root.interrupt;
     return @intCast(interrupt.getTimerTicks());
+}
+
+// ============================================================
+// Console I/O Syscalls
+// ============================================================
+
+/// Write to console
+/// x0 = buffer pointer (user virtual address)
+/// x1 = length
+/// Returns: number of bytes written, or negative error
+fn sysWrite(frame: *SyscallFrame) i64 {
+    const buf_addr = frame.x0;
+    const len = frame.x1;
+
+    // Validate length
+    if (len == 0) return 0;
+    const safe_len: usize = if (len > 4096) 4096 else @truncate(len);
+
+    // Validate address is in user range
+    if (buf_addr < 0x10000 or buf_addr > 0x8000_0000_0000) {
+        return @intFromEnum(Error.INVALID_ARGUMENT);
+    }
+
+    const ptr: [*]const u8 = @ptrFromInt(buf_addr);
+
+    // Write each character to console
+    var written: usize = 0;
+    while (written < safe_len) : (written += 1) {
+        console.putc(ptr[written]);
+    }
+
+    return @intCast(written);
+}
+
+/// Read from console
+/// x0 = buffer pointer (user virtual address)
+/// x1 = max length
+/// Returns: number of bytes read, or negative error
+fn sysRead(frame: *SyscallFrame) i64 {
+    const buf_addr = frame.x0;
+    const max_len = frame.x1;
+
+    // Validate length
+    if (max_len == 0) return 0;
+    const safe_len: usize = if (max_len > 4096) 4096 else @truncate(max_len);
+
+    // Validate address is in user range
+    if (buf_addr < 0x10000 or buf_addr > 0x8000_0000_0000) {
+        return @intFromEnum(Error.INVALID_ARGUMENT);
+    }
+
+    const ptr: [*]u8 = @ptrFromInt(buf_addr);
+
+    // Non-blocking read from UART
+    var read_count: usize = 0;
+    while (read_count < safe_len) {
+        if (console.tryGetc()) |c| {
+            ptr[read_count] = c;
+            read_count += 1;
+            if (c == '\n') break;
+        } else {
+            break;
+        }
+    }
+
+    return @intCast(read_count);
 }
 
 // ============================================================

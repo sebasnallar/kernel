@@ -6,11 +6,12 @@
 //   - Kernel log levels
 //   - Hex/number formatting
 
-// UART hardware interface
+// UART hardware interface (PL011)
 const UART_BASE: usize = 0x09000000;
-const UART_DR: *volatile u32 = @ptrFromInt(UART_BASE + 0x00);
-const UART_FR: *volatile u32 = @ptrFromInt(UART_BASE + 0x18);
-const FR_TXFF: u32 = 1 << 5;
+const UART_DR: *volatile u32 = @ptrFromInt(UART_BASE + 0x00); // Data register
+const UART_FR: *volatile u32 = @ptrFromInt(UART_BASE + 0x18); // Flag register
+const FR_TXFF: u32 = 1 << 5; // TX FIFO full
+const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
 
 // ANSI escape codes for colors
 pub const Color = struct {
@@ -60,6 +61,21 @@ pub fn puts(s: []const u8) void {
         if (c == '\n') putc('\r');
         putc(c);
     }
+}
+
+/// Read a single character (blocking)
+pub fn getc() u8 {
+    while ((UART_FR.* & FR_RXFE) != 0) {}
+    return @truncate(UART_DR.*);
+}
+
+/// Try to read a single character (non-blocking)
+/// Returns null if no data available
+pub fn tryGetc() ?u8 {
+    if ((UART_FR.* & FR_RXFE) != 0) {
+        return null;
+    }
+    return @truncate(UART_DR.*);
 }
 
 /// Write a formatted hex value

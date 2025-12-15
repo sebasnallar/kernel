@@ -201,8 +201,7 @@ pub fn panic(msg: []const u8) noreturn {
 // Test Threads
 // ============================================================
 
-/// Create test processes/threads
-/// Now uses proper per-process address spaces with separate TTBR0
+/// Create user processes
 fn createTestThreads() void {
     const user_program = root.user_program;
 
@@ -210,11 +209,8 @@ fn createTestThreads() void {
     console.putDec(memory.getFreeFrames());
     console.newline();
 
-    // Create TRUE USER processes with their own address spaces
-    // Each process gets its own TTBR0 page table
-
-    // Process A: Simple yield loop
-    const code_a = user_program.getYieldLoopCode();
+    // Process A: Prints "[A] " and yields
+    const code_a = user_program.getHelloACode();
     if (scheduler.createUserProcess(code_a, .normal)) |t| {
         console.puts("  Process A created (PID ");
         if (t.process) |p| {
@@ -230,8 +226,8 @@ fn createTestThreads() void {
         console.status("Process A creation", false);
     }
 
-    // Process B: Another yield loop
-    const code_b = user_program.getYieldLoopCode();
+    // Process B: Prints "[B] " and yields
+    const code_b = user_program.getHelloBCode();
     if (scheduler.createUserProcess(code_b, .normal)) |t| {
         console.puts("  Process B created (PID ");
         if (t.process) |p| {
@@ -251,7 +247,7 @@ fn createTestThreads() void {
     console.putDec(memory.getFreeFrames());
     console.newline();
 
-    console.status("Test processes ready", true);
+    console.status("User processes ready", true);
 }
 
 // Note: Old kernel thread test code has been removed.

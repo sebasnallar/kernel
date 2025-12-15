@@ -131,9 +131,99 @@ pub const ipc_receiver_code = [_]u32{
     0x17FFFFFA, // b -24 (loop back to mov x0, x20)
 };
 
+/// Hello world program that prints and yields:
+///   adr x0, msg        // get address of string (PC-relative)
+///   mov x1, #20        // length of "Hello from userspace!\n"
+///   mov x8, #40        // SYS.WRITE
+///   svc #0
+/// loop:
+///   mov x8, #1         // SYS.YIELD
+///   svc #0
+///   b loop
+/// msg:
+///   .ascii "Hello from userspace!\n"
+pub const hello_world_code = [_]u32{
+    // adr x0, msg (PC + 24 bytes = 6 instructions ahead)
+    0x100000C0, // adr x0, #24
+    // mov x1, #22 (string length)
+    0xD28002C1, // mov x1, #22
+    // mov x8, #40 (SYS.WRITE)
+    0xD2800508, // mov x8, #40
+    // svc #0
+    0xD4000001, // svc #0
+    // loop: mov x8, #1 (SYS.YIELD)
+    0xD2800028, // mov x8, #1
+    // svc #0
+    0xD4000001, // svc #0
+    // b loop (-8 bytes = -2 instructions)
+    0x17FFFFFE, // b -8
+    // msg: "Hello from userspace!\n" (22 bytes, padded to 24)
+    0x6C6C6548, // "Hell"
+    0x7266206F, // "o fr"
+    0x75206D6F, // "om u"
+    0x73726573, // "sers"
+    0x65636170, // "pace"
+    0x000A2121, // "!!\n\0"
+};
+
+/// Hello world program for process A (prints "[A] " and newline)
+/// Layout:
+///   0x00: adr x0, msg     -> PC + 28
+///   0x04: mov x1, #5
+///   0x08: mov x8, #40
+///   0x0C: svc #0
+///   0x10: mov x8, #1
+///   0x14: svc #0
+///   0x18: b -8
+///   0x1C: "[A] \n"
+pub const hello_a_code = [_]u32{
+    // adr x0, #28 (PC-relative: from 0x00, msg is at 0x1C = 28 bytes)
+    // adr encoding: imm = 28, immhi = 0, immlo = 28>>2 = 7
+    // adr x0, #28 = 0x10000380
+    0x100000E0, // adr x0, #28
+    0xD28000A1, // mov x1, #5
+    0xD2800508, // mov x8, #40 (SYS.WRITE)
+    0xD4000001, // svc #0
+    0xD2800028, // mov x8, #1 (SYS.YIELD)
+    0xD4000001, // svc #0
+    0x17FFFFFE, // b -8 (loop back to mov x8, #1)
+    // msg at offset 0x1C: "[A] \n"
+    0x205D415B, // "[A] "
+    0x0000000A, // "\n\0\0\0"
+};
+
+/// Hello world program for process B (prints "[B] " and newline)
+pub const hello_b_code = [_]u32{
+    0x100000E0, // adr x0, #28
+    0xD28000A1, // mov x1, #5
+    0xD2800508, // mov x8, #40 (SYS.WRITE)
+    0xD4000001, // svc #0
+    0xD2800028, // mov x8, #1 (SYS.YIELD)
+    0xD4000001, // svc #0
+    0x17FFFFFE, // b -8
+    // msg: "[B] \n"
+    0x205D425B, // "[B] "
+    0x0000000A, // "\n\0\0\0"
+};
+
 /// Get yield loop code as bytes
 pub fn getYieldLoopCode() []const u8 {
     return @as([*]const u8, @ptrCast(&yield_loop_code))[0 .. yield_loop_code.len * 4];
+}
+
+/// Get hello world code as bytes
+pub fn getHelloWorldCode() []const u8 {
+    return @as([*]const u8, @ptrCast(&hello_world_code))[0 .. hello_world_code.len * 4];
+}
+
+/// Get hello A code as bytes
+pub fn getHelloACode() []const u8 {
+    return @as([*]const u8, @ptrCast(&hello_a_code))[0 .. hello_a_code.len * 4];
+}
+
+/// Get hello B code as bytes
+pub fn getHelloBCode() []const u8 {
+    return @as([*]const u8, @ptrCast(&hello_b_code))[0 .. hello_b_code.len * 4];
 }
 
 /// Get IPC sender code as bytes
