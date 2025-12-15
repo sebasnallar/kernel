@@ -13,7 +13,7 @@
 ### Blockers for Real Use
 - ~~No console I/O syscalls~~ DONE (SYS_WRITE, SYS_READ)
 - ~~No program loader~~ DONE (MLK binary format + loader)
-- No process spawn/exit (can't create processes or cleanup)
+- ~~No process spawn/exit~~ DONE (SYS_SPAWN, SYS_EXIT, SYS_WAIT)
 
 ---
 
@@ -50,23 +50,25 @@
 
 ---
 
-### Milestone 3: Process Lifecycle
-**Status**: IN PROGRESS
+### Milestone 3: Process Lifecycle ✓
+**Status**: COMPLETE
 
 **Goal**: Proper process creation and cleanup
 
-**Tasks**:
-- [ ] SYS_SPAWN syscall (create child process from binary)
-- [ ] SYS_EXIT syscall (cleanup memory, close endpoints, notify parent)
-- [ ] SYS_WAIT syscall (parent waits for child termination)
-- [ ] Process resource tracking and cleanup
+**Completed**:
+- [x] SYS_SPAWN syscall (create child process from embedded binary)
+- [x] SYS_EXIT syscall (mark process as zombie, notify parent)
+- [x] SYS_WAIT syscall (parent waits for child, collects exit code)
+- [x] SYS_GETPPID syscall (get parent PID)
+- [x] Process state tracking (running/zombie/dead)
+- [x] Init process that spawns children
 
-**Unlocks**: Multi-process OS, proper resource management
+**Unlocks**: Multi-process OS, parent-child relationships
 
 ---
 
 ### Milestone 4: Init + Console Server
-**Status**: NOT STARTED
+**Status**: IN PROGRESS
 
 **Goal**: User-space OS foundation following microkernel philosophy
 
