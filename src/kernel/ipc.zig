@@ -420,6 +420,130 @@ pub fn notify(dest: EndpointId, badge: u64) IpcError!void {
 }
 
 // ============================================================
+// RPC Support (call/reply)
+// ============================================================
+
+/// Waiting caller entry for RPC
+const WaitingCaller = struct {
+    thread: *scheduler.Thread,
+    reply_buf: *Message,
+    next: ?*WaitingCaller,
+};
+
+/// Pool of waiting callers
+var caller_pool: [MAX_ENDPOINTS * 4]WaitingCaller = undefined;
+var caller_pool_used: [MAX_ENDPOINTS * 4]bool = [_]bool{false} ** (MAX_ENDPOINTS * 4);
+
+fn allocWaitingCaller() ?*WaitingCaller {
+    for (&caller_pool, 0..) |*entry, i| {
+        if (!caller_pool_used[i]) {
+            caller_pool_used[i] = true;
+            entry.next = null;
+            return entry;
+        }
+    }
+    return null;
+}
+
+fn freeWaitingCaller(entry: *WaitingCaller) void {
+    const idx = (@intFromPtr(entry) - @intFromPtr(&caller_pool[0])) / @sizeOf(WaitingCaller);
+    if (idx < caller_pool_used.len) {
+        caller_pool_used[idx] = false;
+    }
+}
+
+/// Thread-indexed waiting callers (for reply lookup by TID)
+var waiting_callers: [64]?*WaitingCaller = [_]?*WaitingCaller{null} ** 64;
+
+/// RPC call: send message to endpoint, block until reply
+/// L4/seL4 style: client sends request, blocks, server receives, processes, replies
+pub fn call(dest: EndpointId, msg: *Message) IpcError!Message {
+    if (!initialized) return IpcError.InvalidEndpoint;
+
+    const idx = dest.raw();
+    if (idx >= MAX_ENDPOINTS) return IpcError.InvalidEndpoint;
+
+    const ep = &endpoints[idx];
+    if (ep.state != .active) return IpcError.EndpointClosed;
+
+    // Allocate caller entry to store reply buffer
+    const caller_entry = allocWaitingCaller() orelse return IpcError.WouldBlock;
+
+    // Set up reply buffer
+    var reply_buf: Message = .{};
+    caller_entry.reply_buf = &reply_buf;
+
+    // Get current thread
+    const cur = scheduler.getCurrent() orelse {
+        freeWaitingCaller(caller_entry);
+        return IpcError.InvalidEndpoint;
+    };
+    caller_entry.thread = cur;
+
+    // Register as waiting caller (indexed by TID for reply lookup)
+    if (cur.tid < waiting_callers.len) {
+        waiting_callers[cur.tid] = caller_entry;
+    }
+
+    // Set sender in message
+    msg.sender = EndpointId.fromRaw(cur.tid);
+
+    // Check if there's a waiting receiver
+    if (ep.waiting_receiver) |receiver| {
+        // Direct handoff
+        if (ep.receiver_buf) |recv_buf| {
+            copyMessage(recv_buf, msg);
+        }
+        if (ep.receiver_frame) |frame| {
+            frame.x0 = msg.op;
+            frame.x1 = msg.arg0;
+            frame.x2 = msg.arg1;
+        }
+        ep.waiting_receiver = null;
+        ep.receiver_buf = null;
+        ep.receiver_frame = null;
+        scheduler.unblock(receiver);
+    } else {
+        // Queue the message
+        if (!ep.enqueueSender(cur, msg)) {
+            freeWaitingCaller(caller_entry);
+            if (cur.tid < waiting_callers.len) {
+                waiting_callers[cur.tid] = null;
+            }
+            return IpcError.WouldBlock;
+        }
+    }
+
+    // Block waiting for reply
+    scheduler.blockCurrent(.blocked_ipc);
+
+    // Clean up
+    if (cur.tid < waiting_callers.len) {
+        waiting_callers[cur.tid] = null;
+    }
+    freeWaitingCaller(caller_entry);
+
+    return reply_buf;
+}
+
+/// Reply to an RPC call
+/// sender_id is the TID of the thread waiting for reply
+pub fn reply(sender_id: EndpointId, msg: *const Message) IpcError!void {
+    if (!initialized) return IpcError.InvalidEndpoint;
+
+    const tid = sender_id.raw();
+    if (tid >= waiting_callers.len) return IpcError.InvalidEndpoint;
+
+    const caller_entry = waiting_callers[tid] orelse return IpcError.InvalidEndpoint;
+
+    // Copy reply to caller's buffer
+    copyMessage(caller_entry.reply_buf, msg);
+
+    // Unblock the waiting caller
+    scheduler.unblock(caller_entry.thread);
+}
+
+// ============================================================
 // Statistics
 // ============================================================
 

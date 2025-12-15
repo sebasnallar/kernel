@@ -364,17 +364,49 @@ fn sysRecv(frame: *SyscallFrame) i64 {
 }
 
 /// Send and wait for reply (RPC style)
+/// x0 = port_id, x1 = op, x2 = arg0, x3 = arg1
+/// Returns: x0 = reply op, x1 = reply arg0, x2 = reply arg1
 fn sysCall(frame: *SyscallFrame) i64 {
-    // For now, just do send + receive
-    const send_result = sysSend(frame);
-    if (send_result < 0) return send_result;
-    return sysRecv(frame);
+    const port_id: u32 = @truncate(frame.x0);
+    const endpoint = ipc.EndpointId.fromRaw(port_id);
+
+    // Create request message
+    var msg = ipc.Message.init(@truncate(frame.x1));
+    msg.arg0 = frame.x2;
+    msg.arg1 = frame.x3;
+
+    // Do RPC call - blocks until reply received
+    const result = ipc.call(endpoint, &msg);
+    if (result) |reply| {
+        frame.x1 = reply.arg0;
+        frame.x2 = reply.arg1;
+        return @intCast(reply.op);
+    } else |err| {
+        return switch (err) {
+            ipc.IpcError.InvalidEndpoint, ipc.IpcError.EndpointClosed => @intFromEnum(Error.INVALID_PORT),
+            else => @intFromEnum(Error.INVALID_ARGUMENT),
+        };
+    }
 }
 
 /// Reply to a received message
+/// x0 = sender_tid (from received message), x1 = op, x2 = arg0, x3 = arg1
 fn sysReply(frame: *SyscallFrame) i64 {
-    _ = frame;
-    // TODO: Implement proper reply mechanism
+    const sender_tid: u32 = @truncate(frame.x0);
+
+    // Create reply message
+    var reply = ipc.Message.init(@truncate(frame.x1));
+    reply.arg0 = frame.x2;
+    reply.arg1 = frame.x3;
+
+    // Send reply to the waiting caller
+    ipc.reply(ipc.EndpointId.fromRaw(sender_tid), &reply) catch |err| {
+        return switch (err) {
+            ipc.IpcError.InvalidEndpoint => @intFromEnum(Error.NOT_FOUND),
+            else => @intFromEnum(Error.INVALID_ARGUMENT),
+        };
+    };
+
     return 0;
 }
 
