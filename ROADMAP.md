@@ -11,47 +11,47 @@
 - **Syscalls**: Framework ready (partial implementation)
 
 ### Blockers for Real Use
-- No console I/O syscalls (user programs can't print/read)
-- No program loader (only hardcoded machine code blobs)
+- ~~No console I/O syscalls~~ DONE (SYS_WRITE, SYS_READ)
+- ~~No program loader~~ DONE (MLK binary format + loader)
 - No process spawn/exit (can't create processes or cleanup)
 
 ---
 
 ## Milestones
 
-### Milestone 1: Console I/O
-**Status**: IN PROGRESS
+### Milestone 1: Console I/O ✓
+**Status**: COMPLETE
 
 **Goal**: User processes can print and read from console
 
-**Tasks**:
-- [ ] Add SYS_WRITE syscall (write buffer to UART)
-- [ ] Add SYS_READ syscall (read from UART)
-- [ ] Update user program to print "Hello from userspace!"
-- [ ] Test end-to-end
+**Completed**:
+- [x] Add SYS_WRITE syscall (write buffer to UART)
+- [x] Add SYS_READ syscall (read from UART)
+- [x] Update user program to print "Hello from userspace!"
+- [x] Test end-to-end
 
 **Unlocks**: Debugging, basic user interaction
 
 ---
 
-### Milestone 2: Binary Loader
-**Status**: NOT STARTED
+### Milestone 2: Binary Loader ✓
+**Status**: COMPLETE
 
 **Goal**: Load real compiled programs instead of hardcoded blobs
 
-**Tasks**:
-- [ ] Define simple binary format (flat binary with header)
-- [ ] Create loader: parse header, map code/data, set entry point
-- [ ] Build system: compile user programs separately
-- [ ] Embed test binary in kernel image
-- [ ] Load and run as init process
+**Completed**:
+- [x] Define MLK binary format (16-byte header + flat code)
+- [x] Create loader: parseHeader, loadBinary functions
+- [x] Build system: compile user/hello.zig separately
+- [x] Embed hello.mlk in kernel via @embedFile
+- [x] Load and run as userspace processes
 
-**Unlocks**: Write real programs in Zig/C, compile and run them
+**Unlocks**: Write real programs in Zig, compile and run them
 
 ---
 
 ### Milestone 3: Process Lifecycle
-**Status**: NOT STARTED
+**Status**: IN PROGRESS
 
 **Goal**: Proper process creation and cleanup
 
