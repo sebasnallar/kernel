@@ -398,14 +398,6 @@ pub fn schedule() void {
             }
             thread.next = null;
 
-            console.puts(console.Color.dim);
-            console.puts("[SCHED] Picking TID ");
-            console.putDec(thread.tid);
-            console.puts(" from queue ");
-            console.putDec(@as(u32, @truncate(qi)));
-            console.newline();
-            console.puts(console.Color.reset);
-
             // Switch to it
             switchTo(thread);
             return;
@@ -413,9 +405,6 @@ pub fn schedule() void {
     }
 
     // Nothing ready - run idle
-    console.puts(console.Color.dim);
-    console.puts("[SCHED] No ready threads, going idle\n");
-    console.puts(console.Color.reset);
     switchTo(idle_thread);
 }
 
@@ -436,16 +425,6 @@ fn switchTo(thread: *Thread) void {
 
             if (thread.is_user) {
                 // User thread: drop to EL0 via ERET
-                console.puts(console.Color.cyan);
-                console.puts("[SCHED] Dropping TID ");
-                console.putDec(thread.tid);
-                console.puts(" to EL0: pc=0x");
-                console.putHex(thread.context.pc);
-                console.puts(" usp=0x");
-                console.putHex(thread.user_sp);
-                console.newline();
-                console.puts(console.Color.reset);
-
                 context.startUserThreadInline(
                     &o.context,
                     thread.context.pc, // Entry point
@@ -486,22 +465,8 @@ pub fn yield() void {
 /// Block current thread
 pub fn blockCurrent(reason: State) void {
     if (current) |c| {
-        console.puts(console.Color.yellow);
-        console.puts("[SCHED] Blocking TID ");
-        console.putDec(c.tid);
-        console.puts(" reason=");
-        console.putDec(@intFromEnum(reason));
-        console.newline();
-        console.puts(console.Color.reset);
-
         c.state = reason;
         schedule();
-
-        console.puts(console.Color.yellow);
-        console.puts("[SCHED] TID ");
-        console.putDec(c.tid);
-        console.puts(" resumed\n");
-        console.puts(console.Color.reset);
     }
 }
 

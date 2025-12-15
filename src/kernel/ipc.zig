@@ -254,12 +254,6 @@ pub fn receive(from: EndpointId, msg: *Message) IpcError!void {
     if (!initialized) return IpcError.InvalidEndpoint;
 
     const idx = from.raw();
-    console.puts(console.Color.cyan);
-    console.puts("[IPC] receive ep=");
-    console.putDec(idx);
-    console.newline();
-    console.puts(console.Color.reset);
-
     if (idx >= MAX_ENDPOINTS) return IpcError.InvalidEndpoint;
 
     const ep = &endpoints[idx];
@@ -281,7 +275,6 @@ pub fn receive(from: EndpointId, msg: *Message) IpcError!void {
 
     // Check if there's a waiting sender with a message
     if (ep.waiting_sender) |sender| {
-        console.puts("[IPC] has waiting sender\n");
         if (ep.has_pending_msg) {
             // Copy the pending message field-by-field
             msg.op = ep.pending_msg.op;
@@ -298,14 +291,12 @@ pub fn receive(from: EndpointId, msg: *Message) IpcError!void {
         scheduler.unblock(sender);
     } else {
         // No sender waiting - block until one arrives
-        console.puts("[IPC] no sender, blocking...\n");
         if (scheduler.getCurrent()) |cur| {
             ep.waiting_receiver = cur;
         }
         ep.receiver_buf = msg;
         scheduler.blockCurrent(.blocked_ipc);
         // When we wake up, the message has been copied to msg
-        console.puts("[IPC] unblocked!\n");
         ep.receiver_buf = null;
     }
 }

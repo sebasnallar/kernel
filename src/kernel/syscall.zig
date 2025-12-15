@@ -99,23 +99,10 @@ pub const SyscallFrame = struct {
 // System Call Dispatcher
 // ============================================================
 
-var syscall_total: u32 = 0;
-
 /// Main syscall dispatcher - called from exception handler
 /// Returns the result in frame.x0
 pub fn dispatch(frame: *SyscallFrame) void {
     const syscall_num = frame.x8;
-
-    syscall_total += 1;
-    if (syscall_total <= 10 or syscall_total % 100 == 0) {
-        console.puts(console.Color.yellow);
-        console.puts("[SYS] #");
-        console.putDec(syscall_total);
-        console.puts(" num=");
-        console.putDec(@as(u32, @truncate(syscall_num)));
-        console.newline();
-        console.puts(console.Color.reset);
-    }
 
     const result: i64 = switch (syscall_num) {
         // Process/Thread control
@@ -190,6 +177,9 @@ const console = root.console;
 var send_count: u32 = 0;
 var recv_count: u32 = 0;
 
+// Static buffer for send (avoid stack issues)
+var send_msg_buf: ipc.Message = .{};
+
 /// Send message to a port
 /// x0 = port_id, x1 = op, x2 = arg0, x3 = arg1
 fn sysSend(frame: *SyscallFrame) i64 {
@@ -197,13 +187,18 @@ fn sysSend(frame: *SyscallFrame) i64 {
     const op: u32 = @truncate(frame.x1);
     const endpoint = ipc.EndpointId.fromRaw(port_id);
 
-    // Build message from registers
-    var msg = ipc.Message.init(op);
-    msg.arg0 = frame.x2;
-    msg.arg1 = frame.x3;
+    // Build message in static buffer
+    send_msg_buf.op = op;
+    send_msg_buf.arg0 = frame.x2;
+    send_msg_buf.arg1 = frame.x3;
+    send_msg_buf.arg2 = 0;
+    send_msg_buf.arg3 = 0;
+    send_msg_buf.sender = .invalid;
+    send_msg_buf.reply_to = .invalid;
+    send_msg_buf.badge = 0;
 
     // Try to send
-    ipc.send(endpoint, &msg) catch |err| {
+    ipc.send(endpoint, &send_msg_buf) catch |err| {
         return switch (err) {
             ipc.IpcError.InvalidEndpoint => @intFromEnum(Error.INVALID_PORT),
             ipc.IpcError.EndpointClosed => @intFromEnum(Error.INVALID_PORT),

@@ -45,25 +45,11 @@ pub fn install() void {
     const el0_sync_b_inst = encodeB(el0_sync_vector_addr, el0_sync_handler_addr);
     table_ptr[0x400 / 4] = el0_sync_b_inst;
 
-    console.puts("  EL0 Sync vector: 0x");
-    console.putHex(el0_sync_vector_addr);
-    console.puts(" -> 0x");
-    console.putHex(el0_sync_handler_addr);
-    console.puts(" (inst=0x");
-    console.putHex(el0_sync_b_inst);
-    console.puts(")\n");
-
     // Patch EL0 IRQ vector (at offset 0x480) - interrupts while in userspace
     const el0_irq_handler_addr = @intFromPtr(&el0IrqEntry);
     const el0_irq_vector_addr = vbar + 0x480;
     const el0_irq_b_inst = encodeB(el0_irq_vector_addr, el0_irq_handler_addr);
     table_ptr[0x480 / 4] = el0_irq_b_inst;
-
-    console.puts("  EL0 IRQ vector: 0x");
-    console.putHex(el0_irq_vector_addr);
-    console.puts(" -> 0x");
-    console.putHex(el0_irq_handler_addr);
-    console.puts("\n");
 
     // Ensure write is visible
     asm volatile ("dsb sy");
@@ -379,20 +365,7 @@ pub const El0Frame = struct {
     sp_el0: u64,
 };
 
-var el0_sync_count: u32 = 0;
-
 export fn handleEl0SyncWrapper(frame: *El0Frame) callconv(.C) void {
-    el0_sync_count += 1;
-    if (el0_sync_count <= 5) {
-        console.puts(console.Color.magenta);
-        console.puts("[EL0-SYNC] Entry #");
-        console.putDec(el0_sync_count);
-        console.puts(" x8=");
-        console.putDec(@as(u32, @truncate(frame.x8)));
-        console.newline();
-        console.puts(console.Color.reset);
-    }
-
     // Read ESR to determine exception type
     var esr: u64 = undefined;
     asm volatile ("mrs %[esr], esr_el1"
@@ -401,14 +374,6 @@ export fn handleEl0SyncWrapper(frame: *El0Frame) callconv(.C) void {
 
     // Extract exception class (bits 31:26)
     const ec = (esr >> 26) & 0x3F;
-
-    if (el0_sync_count <= 5) {
-        console.puts(console.Color.magenta);
-        console.puts("  EC=0x");
-        console.putHex(ec);
-        console.newline();
-        console.puts(console.Color.reset);
-    }
 
     // EC 0x15 = SVC instruction (64-bit)
     if (ec == 0x15) {
@@ -488,18 +453,7 @@ pub fn el0IrqEntry() callconv(.Naked) void {
     );
 }
 
-var el0_irq_count: u32 = 0;
-
 export fn handleEl0IrqWrapper() callconv(.C) void {
-    el0_irq_count += 1;
-    if (el0_irq_count <= 5) {
-        console.puts(console.Color.blue);
-        console.puts("[EL0-IRQ] #");
-        console.putDec(el0_irq_count);
-        console.newline();
-        console.puts(console.Color.reset);
-    }
-
     // Handle the interrupt (same as kernel mode)
     interrupt.handleIrq();
 
