@@ -12,6 +12,8 @@ const root = @import("root");
 const scheduler = root.scheduler;
 const ipc = root.ipc;
 const console = root.console;
+const loader = root.loader;
+const binaries = root.binaries;
 
 // ============================================================
 // System Call Numbers
@@ -20,10 +22,13 @@ const console = root.console;
 /// System call numbers - keep these stable for ABI compatibility
 pub const SYS = struct {
     // Process/Thread control
-    pub const EXIT: u64 = 0; // Exit current thread
+    pub const EXIT: u64 = 0; // Exit current thread/process (x0=exit_code)
     pub const YIELD: u64 = 1; // Yield time slice
     pub const GETPID: u64 = 2; // Get process ID
     pub const GETTID: u64 = 3; // Get thread ID
+    pub const SPAWN: u64 = 4; // Spawn process from embedded binary (x0=binary_id) -> pid
+    pub const WAIT: u64 = 5; // Wait for child process (x0=pid, -1=any) -> exit_code
+    pub const GETPPID: u64 = 6; // Get parent process ID
 
     // IPC - Synchronous message passing (microkernel core!)
     pub const SEND: u64 = 10; // Send message to port
@@ -66,6 +71,8 @@ pub const Error = enum(i64) {
     INVALID_PORT = -9,
     QUEUE_FULL = -10,
     QUEUE_EMPTY = -11,
+    NO_CHILDREN = -12,
+    CHILD_RUNNING = -13,
 };
 
 // ============================================================
@@ -119,6 +126,9 @@ pub fn dispatch(frame: *SyscallFrame) void {
         SYS.YIELD => sysYield(),
         SYS.GETPID => sysGetPid(),
         SYS.GETTID => sysGetTid(),
+        SYS.SPAWN => sysSpawn(frame),
+        SYS.WAIT => sysWait(frame),
+        SYS.GETPPID => sysGetPpid(),
 
         // IPC
         SYS.SEND => sysSend(frame),
@@ -152,14 +162,12 @@ pub fn dispatch(frame: *SyscallFrame) void {
 // System Call Implementations
 // ============================================================
 
-/// Exit current thread
+/// Exit current process with exit code
+/// x0 = exit_code
 fn sysExit(frame: *SyscallFrame) i64 {
-    _ = frame;
-    if (scheduler.getCurrent()) |thread| {
-        thread.state = .dead;
-    }
-    scheduler.yield();
-    // Should not return
+    const exit_code: i32 = @truncate(@as(i64, @bitCast(frame.x0)));
+    scheduler.exitProcess(exit_code);
+    // Should not return - scheduler will switch to another process
     return 0;
 }
 
@@ -192,6 +200,73 @@ fn sysGetTid() i64 {
     return 0;
 }
 
+/// Get parent process ID
+fn sysGetPpid() i64 {
+    if (scheduler.getCurrent()) |thread| {
+        if (thread.process) |proc| {
+            if (proc.parent_pid) |ppid| {
+                return @intCast(ppid);
+            }
+        }
+    }
+    return 0; // No parent (init process or kernel thread)
+}
+
+/// Spawn a new process from embedded binary
+/// x0 = binary_id (0 = hello)
+/// Returns: child PID on success, negative error on failure
+fn sysSpawn(frame: *SyscallFrame) i64 {
+    const binary_id = frame.x0;
+
+    // Get current process PID as parent
+    const parent_pid: ?scheduler.Pid = if (scheduler.getCurrent()) |thread|
+        if (thread.process) |proc| proc.pid else null
+    else
+        null;
+
+    // Select binary based on ID
+    const binary_data: []const u8 = switch (binary_id) {
+        0 => binaries.hello,
+        else => return @intFromEnum(Error.INVALID_ARGUMENT),
+    };
+
+    // Load the binary with parent relationship
+    const thread = scheduler.createUserProcessWithParent(
+        binary_data[loader.HEADER_SIZE..],
+        .normal,
+        parent_pid,
+    ) orelse return @intFromEnum(Error.NO_MEMORY);
+
+    // Return the child's PID
+    if (thread.process) |proc| {
+        return @intCast(proc.pid);
+    }
+    return @intFromEnum(Error.NO_MEMORY);
+}
+
+/// Wait for a child process to exit
+/// x0 = target PID (-1 = any child)
+/// Returns: exit code on success, negative error on failure
+fn sysWait(frame: *SyscallFrame) i64 {
+    const target: i64 = @bitCast(frame.x0);
+    const target_pid: ?scheduler.Pid = if (target < 0) null else @intCast(@as(u64, @bitCast(target)));
+
+    // Check if we have any children at all
+    if (!scheduler.hasChildren()) {
+        return @intFromEnum(Error.NO_CHILDREN);
+    }
+
+    // Try to collect a zombie child
+    if (scheduler.waitForChild(target_pid)) |result| {
+        // Return exit code in x0, pid in x1
+        frame.x1 = result.pid;
+        return result.exit_code;
+    }
+
+    // No zombie child yet - block and wait
+    scheduler.blockCurrent(.blocked_wait);
+    return SYSCALL_BLOCKED;
+}
 
 // Static send buffer to avoid stack issues with struct initialization
 var send_msg_buf: ipc.Message = .{

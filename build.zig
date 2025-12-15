@@ -37,9 +37,31 @@ pub fn build(b: *std.Build) void {
     // Create MLK binary with header using a custom step
     const mkbin_step = MkBinStep.create(b, hello_bin.getOutput(), "hello.mlk");
 
-    // Install the MLK binary
-    const install_mlk = b.addInstallBinFile(mkbin_step.getOutput(), "hello.mlk");
-    b.default_step.dependOn(&install_mlk.step);
+    // Install the hello MLK binary
+    const install_hello = b.addInstallBinFile(mkbin_step.getOutput(), "hello.mlk");
+    b.default_step.dependOn(&install_hello.step);
+
+    // Build init user program
+    const init = b.addExecutable(.{
+        .name = "init",
+        .root_source_file = b.path("user/init.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .pic = true,
+    });
+    init.setLinkerScript(b.path("user/user.ld"));
+    init.root_module.stack_protector = false;
+    init.root_module.link_libc = false;
+
+    const init_bin = init.addObjCopy(.{
+        .basename = "init.bin",
+        .format = .bin,
+    });
+
+    const init_mkbin = MkBinStep.create(b, init_bin.getOutput(), "init.mlk");
+    const install_init = b.addInstallBinFile(init_mkbin.getOutput(), "init.mlk");
+    b.default_step.dependOn(&install_init.step);
 
     // ============================================================
     // Kernel
@@ -63,10 +85,11 @@ pub fn build(b: *std.Build) void {
     // Don't link libc
     kernel.root_module.link_libc = false;
 
-    // Make hello.mlk available for @embedFile
-    // We need to write the MLK to a known location first
-    const write_mlk = WriteFileStep.create(b, mkbin_step.getOutput(), "src/embedded/hello.mlk");
-    kernel.step.dependOn(&write_mlk.step);
+    // Make MLK binaries available for @embedFile
+    const write_hello = WriteFileStep.create(b, mkbin_step.getOutput(), "src/embedded/hello.mlk");
+    const write_init = WriteFileStep.create(b, init_mkbin.getOutput(), "src/embedded/init.mlk");
+    kernel.step.dependOn(&write_hello.step);
+    kernel.step.dependOn(&write_init.step);
 
     // Install the kernel binary
     b.installArtifact(kernel);

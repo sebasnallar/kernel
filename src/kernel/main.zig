@@ -209,17 +209,15 @@ fn createTestThreads() void {
     console.putDec(memory.getFreeFrames());
     console.newline();
 
-    // Load hello world program from embedded MLK binary
-    console.puts("  Loading hello.mlk (");
-    console.putDec(binaries.hello.len);
+    // Load init process (the first user process)
+    console.puts("  Loading init.mlk (");
+    console.putDec(binaries.init.len);
     console.puts(" bytes)...\n");
 
-    // Show binary info
-    loader.printInfo(binaries.hello);
+    loader.printInfo(binaries.init);
 
-    // Load two instances of the hello program
-    if (loader.loadBinary(binaries.hello, .normal)) |t| {
-        console.puts("  Process 1 created (PID ");
+    if (loader.loadBinary(binaries.init, .normal)) |t| {
+        console.puts("  Init process created (PID ");
         if (t.process) |p| {
             console.putDec(p.pid);
         }
@@ -230,29 +228,7 @@ fn createTestThreads() void {
         console.puts("USER (EL0)\n");
         console.puts(console.Color.reset);
     } else |err| {
-        console.puts("  Process 1 failed: ");
-        switch (err) {
-            loader.LoadError.InvalidMagic => console.puts("invalid magic\n"),
-            loader.LoadError.InvalidHeader => console.puts("invalid header\n"),
-            loader.LoadError.CodeTooLarge => console.puts("code too large\n"),
-            loader.LoadError.OutOfMemory => console.puts("out of memory\n"),
-            loader.LoadError.ProcessCreationFailed => console.puts("process creation failed\n"),
-        }
-    }
-
-    if (loader.loadBinary(binaries.hello, .normal)) |t| {
-        console.puts("  Process 2 created (PID ");
-        if (t.process) |p| {
-            console.putDec(p.pid);
-        }
-        console.puts(", TID ");
-        console.putDec(t.tid);
-        console.puts(") - ");
-        console.puts(console.Color.green);
-        console.puts("USER (EL0)\n");
-        console.puts(console.Color.reset);
-    } else |err| {
-        console.puts("  Process 2 failed: ");
+        console.puts("  Init process failed: ");
         switch (err) {
             loader.LoadError.InvalidMagic => console.puts("invalid magic\n"),
             loader.LoadError.InvalidHeader => console.puts("invalid header\n"),
@@ -266,7 +242,7 @@ fn createTestThreads() void {
     console.putDec(memory.getFreeFrames());
     console.newline();
 
-    console.status("User processes ready", true);
+    console.status("Init process ready", true);
 }
 
 // Note: Old kernel thread test code has been removed.

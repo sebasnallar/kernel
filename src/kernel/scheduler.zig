@@ -90,6 +90,13 @@ pub const Thread = struct {
     kernel_sp: u64, // Kernel stack for syscall/exception handling
 };
 
+/// Process state
+pub const ProcessState = enum {
+    running, // Process is active (has threads)
+    zombie, // Process exited, waiting for parent to wait()
+    dead, // Process fully cleaned up
+};
+
 /// Process Control Block
 pub const Process = struct {
     pid: Pid,
@@ -102,8 +109,12 @@ pub const Process = struct {
     // Thread list
     thread_count: u32,
 
-    // Parent
+    // Parent-child relationship
     parent_pid: ?Pid,
+
+    // Process state and exit info
+    state: ProcessState,
+    exit_code: i32,
 };
 
 // ============================================================
@@ -143,6 +154,8 @@ var processes: [MAX_PROCESSES]Process = [_]Process{Process{
     .address_space = .{ .root = 0, .asid = 0 },
     .thread_count = 0,
     .parent_pid = null,
+    .state = .dead,
+    .exit_code = 0,
 }} ** MAX_PROCESSES;
 var process_used: [MAX_PROCESSES]bool = [_]bool{false} ** MAX_PROCESSES;
 
@@ -726,6 +739,8 @@ pub fn createUserProcess(code: []const u8, priority: Priority) ?*Thread {
     proc.address_space = addr_space_init;
     proc.thread_count = 0;
     proc.parent_pid = null;
+    proc.state = .running;
+    proc.exit_code = 0;
     next_pid += 1;
 
     // Step 8: Create the main thread for this process
@@ -794,4 +809,121 @@ pub fn switchToKernelAddressSpace() void {
     // Set TTBR0 to kernel page table (identity mapping)
     mmu.writeTtbr0(mmu.getKernelRoot());
     asm volatile ("isb");
+}
+
+// ============================================================
+// Process Lifecycle
+// ============================================================
+
+/// Terminate the current process with an exit code
+/// Marks all threads as dead, puts process in zombie state
+pub fn exitProcess(exit_code: i32) void {
+    const curr = current orelse return;
+    const proc = curr.process orelse return;
+
+    // Mark all threads belonging to this process as dead
+    for (&threads, 0..) |*t, i| {
+        if (thread_used[i] and t.process == proc) {
+            t.state = .dead;
+        }
+    }
+
+    // Put process in zombie state (waiting for parent to collect exit code)
+    proc.state = .zombie;
+    proc.exit_code = exit_code;
+
+    // Wake up parent if it's waiting on us
+    if (proc.parent_pid) |ppid| {
+        if (findProcess(ppid)) |parent_proc| {
+            _ = parent_proc; // Parent might have a waiting thread
+            // Wake up any thread waiting on this child
+            for (&threads, 0..) |*t, i| {
+                if (thread_used[i] and t.process != null) {
+                    if (t.process.?.pid == ppid and t.state == .blocked_wait) {
+                        unblock(t);
+                    }
+                }
+            }
+        }
+    }
+
+    // Schedule another process
+    setNeedReschedule();
+}
+
+/// Wait for a child process to exit
+/// Returns the exit code, or error if no children
+pub const WaitResult = struct {
+    pid: Pid,
+    exit_code: i32,
+};
+
+pub fn waitForChild(target_pid: ?Pid) ?WaitResult {
+    const curr = current orelse return null;
+    const proc = curr.process orelse return null;
+    const my_pid = proc.pid;
+
+    // Find a zombie child
+    for (&processes, 0..) |*p, i| {
+        if (process_used[i] and p.parent_pid == my_pid) {
+            // Found a child
+            if (target_pid == null or target_pid == p.pid) {
+                if (p.state == .zombie) {
+                    // Collect the zombie
+                    const result = WaitResult{
+                        .pid = p.pid,
+                        .exit_code = p.exit_code,
+                    };
+                    // Clean up the process
+                    cleanupProcess(p);
+                    return result;
+                }
+            }
+        }
+    }
+
+    return null; // No zombie children found
+}
+
+/// Check if current process has any children
+pub fn hasChildren() bool {
+    const curr = current orelse return false;
+    const proc = curr.process orelse return false;
+    const my_pid = proc.pid;
+
+    for (&processes, 0..) |*p, i| {
+        if (process_used[i] and p.parent_pid == my_pid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Find a process by PID
+pub fn findProcess(pid: Pid) ?*Process {
+    for (&processes, 0..) |*p, i| {
+        if (process_used[i] and p.pid == pid) {
+            return p;
+        }
+    }
+    return null;
+}
+
+/// Clean up a zombie process (free all resources)
+fn cleanupProcess(proc: *Process) void {
+    // Free address space page tables
+    // TODO: Actually free physical pages used by process
+
+    // Mark as fully dead
+    proc.state = .dead;
+    freeProcess(proc);
+}
+
+/// Create a user process with a specified parent
+pub fn createUserProcessWithParent(code: []const u8, priority: Priority, parent_pid: ?Pid) ?*Thread {
+    const thread = createUserProcess(code, priority) orelse return null;
+    if (thread.process) |proc| {
+        proc.parent_pid = parent_pid;
+    }
+    return thread;
 }
