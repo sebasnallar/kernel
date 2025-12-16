@@ -914,8 +914,8 @@ const BLK_OP_GET_CAPACITY: u32 = 2; // Get capacity in sectors
 const BLK_OP_GET_STATUS: u32 = 3; // Get device status
 const BLK_OP_READ_BYTES: u32 = 4; // Read bytes (arg0=sector, arg1=offset) -> returns 8 bytes at offset
 
-// Well-known port for block device service
-const BLKDEV_PORT: u64 = 3;
+// Well-known port for block device service (fs=3, blkdev=4)
+const BLKDEV_PORT: u64 = 4;
 
 // Error codes
 const BLK_OK: u32 = 0;

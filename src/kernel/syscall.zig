@@ -238,6 +238,8 @@ fn sysSpawn(frame: *SyscallFrame) i64 {
         binaries.BINARY_INIT => binaries.init,
         binaries.BINARY_CONSOLE => binaries.console,
         binaries.BINARY_BLKDEV => binaries.blkdev,
+        binaries.BINARY_FS => binaries.fs,
+        binaries.BINARY_SHELL => binaries.shell,
         else => return @intFromEnum(Error.INVALID_ARGUMENT),
     };
 

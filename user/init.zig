@@ -16,6 +16,8 @@ const SYS = struct {
 const BINARY_HELLO: u64 = 0;
 const BINARY_CONSOLE: u64 = 2;
 const BINARY_BLKDEV: u64 = 3;
+const BINARY_FS: u64 = 4;
+const BINARY_SHELL: u64 = 5;
 
 fn syscall0(num: u64) i64 {
     var ret: i64 = undefined;
@@ -117,7 +119,24 @@ export fn _start() callconv(.C) noreturn {
         yield();
     }
 
-    // Step 2: Spawn block device driver
+    // Step 2: Spawn filesystem server (gets port 3)
+    write("[init] Spawning filesystem server...\n");
+    const fs_pid = spawn(BINARY_FS);
+    if (fs_pid > 0) {
+        write("[init] Filesystem server started (PID ");
+        putDec(@bitCast(fs_pid));
+        write(")\n");
+    } else {
+        write("[init] Failed to spawn filesystem server!\n");
+    }
+
+    // Give fs time to initialize
+    i = 0;
+    while (i < 10) : (i += 1) {
+        yield();
+    }
+
+    // Step 3: Spawn block device driver (gets port 4)
     write("[init] Spawning block device driver...\n");
     const blkdev_pid = spawn(BINARY_BLKDEV);
     if (blkdev_pid > 0) {
@@ -130,28 +149,23 @@ export fn _start() callconv(.C) noreturn {
 
     // Give block driver time to initialize
     i = 0;
-    while (i < 20) : (i += 1) {
+    while (i < 100) : (i += 1) {
         yield();
     }
 
-    // Step 3: Spawn multiple application processes (test IPC sender queue)
-    write("[init] Spawning 3 hello processes...\n");
-
-    var pids: [3]i64 = undefined;
-    var j: usize = 0;
-    while (j < 3) : (j += 1) {
-        pids[j] = spawn(BINARY_HELLO);
-        write("[init] Spawned hello (PID ");
-        if (pids[j] > 0) {
-            putDec(@bitCast(pids[j]));
-        } else {
-            write("ERROR");
-        }
+    // Step 4: Spawn shell
+    write("[init] Spawning shell...\n");
+    const shell_pid = spawn(BINARY_SHELL);
+    if (shell_pid > 0) {
+        write("[init] Shell started (PID ");
+        putDec(@bitCast(shell_pid));
         write(")\n");
+    } else {
+        write("[init] Failed to spawn shell!\n");
     }
 
     // Let everything run
-    write("[init] System running. Entering idle loop.\n");
+    write("[init] System ready.\n");
 
     while (true) {
         // Check for terminated children

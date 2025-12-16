@@ -16,7 +16,7 @@ const SYS = struct {
 const CONSOLE_PORT: u64 = 2;
 
 // Block device server well-known port
-const BLKDEV_PORT: u64 = 3;
+const BLKDEV_PORT: u64 = 4;
 
 // Console protocol operations
 const CONSOLE_WRITE: u64 = 1;

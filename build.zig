@@ -107,6 +107,50 @@ pub fn build(b: *std.Build) void {
     const install_blkdev = b.addInstallBinFile(blkdev_mkbin.getOutput(), "blkdev.mlk");
     b.default_step.dependOn(&install_blkdev.step);
 
+    // Build filesystem server
+    const fs_srv = b.addExecutable(.{
+        .name = "fs",
+        .root_source_file = b.path("user/fs.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .pic = true,
+    });
+    fs_srv.setLinkerScript(b.path("user/user.ld"));
+    fs_srv.root_module.stack_protector = false;
+    fs_srv.root_module.link_libc = false;
+
+    const fs_bin = fs_srv.addObjCopy(.{
+        .basename = "fs.bin",
+        .format = .bin,
+    });
+
+    const fs_mkbin = MkBinStep.create(b, fs_bin.getOutput(), "fs.mlk");
+    const install_fs = b.addInstallBinFile(fs_mkbin.getOutput(), "fs.mlk");
+    b.default_step.dependOn(&install_fs.step);
+
+    // Build shell
+    const shell = b.addExecutable(.{
+        .name = "shell",
+        .root_source_file = b.path("user/shell.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .pic = true,
+    });
+    shell.setLinkerScript(b.path("user/user.ld"));
+    shell.root_module.stack_protector = false;
+    shell.root_module.link_libc = false;
+
+    const shell_bin = shell.addObjCopy(.{
+        .basename = "shell.bin",
+        .format = .bin,
+    });
+
+    const shell_mkbin = MkBinStep.create(b, shell_bin.getOutput(), "shell.mlk");
+    const install_shell = b.addInstallBinFile(shell_mkbin.getOutput(), "shell.mlk");
+    b.default_step.dependOn(&install_shell.step);
+
     // ============================================================
     // Kernel
     // ============================================================
@@ -134,10 +178,14 @@ pub fn build(b: *std.Build) void {
     const write_init = WriteFileStep.create(b, init_mkbin.getOutput(), "src/embedded/init.mlk");
     const write_console = WriteFileStep.create(b, console_mkbin.getOutput(), "src/embedded/console.mlk");
     const write_blkdev = WriteFileStep.create(b, blkdev_mkbin.getOutput(), "src/embedded/blkdev.mlk");
+    const write_fs = WriteFileStep.create(b, fs_mkbin.getOutput(), "src/embedded/fs.mlk");
+    const write_shell = WriteFileStep.create(b, shell_mkbin.getOutput(), "src/embedded/shell.mlk");
     kernel.step.dependOn(&write_hello.step);
     kernel.step.dependOn(&write_init.step);
     kernel.step.dependOn(&write_console.step);
     kernel.step.dependOn(&write_blkdev.step);
+    kernel.step.dependOn(&write_fs.step);
+    kernel.step.dependOn(&write_shell.step);
 
     // Install the kernel binary
     b.installArtifact(kernel);
