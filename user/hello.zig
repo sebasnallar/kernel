@@ -15,9 +15,16 @@ const SYS = struct {
 // Console server well-known port
 const CONSOLE_PORT: u64 = 2;
 
+// Block device server well-known port
+const BLKDEV_PORT: u64 = 3;
+
 // Console protocol operations
 const CONSOLE_WRITE: u64 = 1;
 const CONSOLE_PUTC: u64 = 4;
+
+// Block device protocol operations
+const BLK_OP_READ: u64 = 1;
+const BLK_OP_GET_CAPACITY: u64 = 2;
 
 fn syscall0(num: u64) i64 {
     var ret: i64 = undefined;
@@ -106,6 +113,65 @@ export fn _start() callconv(.C) noreturn {
     consoleWrite("[hello:");
     putDec(@bitCast(pid));
     consoleWrite("] Hi via IPC!\n");
+
+    // Wait for block device to be ready (it needs to init hardware)
+    // Retry the send until it succeeds (port 3 exists)
+    consoleWrite("[hello:");
+    putDec(@bitCast(pid));
+    consoleWrite("] Waiting for blkdev...\n");
+
+    // Test block device IPC - request capacity (with retries)
+    var cap_result: i64 = -1;
+    var retry: u32 = 0;
+    while (cap_result < 0 and retry < 100) : (retry += 1) {
+        // Wait before each attempt
+        var i: u32 = 0;
+        while (i < 100) : (i += 1) {
+            yield();
+        }
+        cap_result = sendMsg(BLKDEV_PORT, BLK_OP_GET_CAPACITY, 0, 0);
+    }
+
+    consoleWrite("[hello:");
+    putDec(@bitCast(pid));
+    if (cap_result < 0) {
+        consoleWrite("] Capacity request failed after retries\n");
+    } else {
+        consoleWrite("] Capacity request sent!\n");
+    }
+
+    // Yield to let blkdev process the request
+    var j: u32 = 0;
+    while (j < 50) : (j += 1) {
+        yield();
+    }
+
+    // Test block device IPC - request sector 0 read
+    consoleWrite("[hello:");
+    putDec(@bitCast(pid));
+    consoleWrite("] Requesting sector 0 read...\n");
+    const read_result = sendMsg(BLKDEV_PORT, BLK_OP_READ, 0, 0);
+    if (read_result < 0) {
+        consoleWrite("[hello:");
+        putDec(@bitCast(pid));
+        consoleWrite("] Read request failed: ");
+        putDec(@abs(read_result));
+        consoleWrite("\n");
+    } else {
+        consoleWrite("[hello:");
+        putDec(@bitCast(pid));
+        consoleWrite("] Read request sent!\n");
+    }
+
+    // Yield to let blkdev process the request
+    j = 0;
+    while (j < 100) : (j += 1) {
+        yield();
+    }
+
+    consoleWrite("[hello:");
+    putDec(@bitCast(pid));
+    consoleWrite("] Done!\n");
 
     // Exit cleanly
     _ = syscall0(SYS.EXIT);

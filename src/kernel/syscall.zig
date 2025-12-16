@@ -44,6 +44,9 @@ pub const SYS = struct {
     // Memory management
     pub const MMAP: u64 = 30; // Map memory
     pub const MUNMAP: u64 = 31; // Unmap memory
+    pub const MAP_DEVICE: u64 = 32; // Map device MMIO region (x0=phys, x1=size) -> virt addr
+    pub const ALLOC_DMA: u64 = 33; // Allocate DMA memory (x0=size) -> virt addr (x1=phys returned)
+    pub const GET_PHYS: u64 = 34; // Get physical address of virtual address (x0=virt) -> phys
 
     // Console I/O
     pub const WRITE: u64 = 40; // Write to console (x0=buf, x1=len) -> bytes written
@@ -140,6 +143,11 @@ pub fn dispatch(frame: *SyscallFrame) void {
         SYS.PORT_CREATE => sysPortCreate(),
         SYS.PORT_DESTROY => sysPortDestroy(frame),
 
+        // Memory management
+        SYS.MAP_DEVICE => sysMapDevice(frame),
+        SYS.ALLOC_DMA => sysAllocDma(frame),
+        SYS.GET_PHYS => sysGetPhys(frame),
+
         // Console I/O
         SYS.WRITE => sysWrite(frame),
         SYS.READ => sysRead(frame),
@@ -229,6 +237,7 @@ fn sysSpawn(frame: *SyscallFrame) i64 {
         binaries.BINARY_HELLO => binaries.hello,
         binaries.BINARY_INIT => binaries.init,
         binaries.BINARY_CONSOLE => binaries.console,
+        binaries.BINARY_BLKDEV => binaries.blkdev,
         else => return @intFromEnum(Error.INVALID_ARGUMENT),
     };
 
@@ -426,6 +435,182 @@ fn sysPortDestroy(frame: *SyscallFrame) i64 {
     const port_id: u32 = @truncate(frame.x0);
     ipc.destroyEndpoint(ipc.EndpointId.fromRaw(port_id));
     return 0;
+}
+
+// ============================================================
+// Memory Management Syscalls
+// ============================================================
+
+const mmu = root.mmu;
+
+/// Well-known device regions that can be mapped (whitelist for security)
+const DeviceRegion = struct {
+    phys: u64,
+    size: u64,
+};
+
+/// Allowed device regions (QEMU virt machine)
+const ALLOWED_DEVICES = [_]DeviceRegion{
+    // VirtIO MMIO devices: 32 slots, 512 bytes each = 0x4000 bytes total
+    // Range: 0x0a000000 - 0x0a003fff
+    .{ .phys = 0x0a000000, .size = 0x4000 }, // VirtIO device region
+    // GIC (for interrupt management)
+    .{ .phys = 0x08000000, .size = 0x20000 }, // GIC distributor + CPU interface
+    // UART (already mapped, but drivers might want it)
+    .{ .phys = 0x09000000, .size = 0x1000 }, // PL011 UART
+};
+
+/// Fixed virtual base for device mappings in user space
+const USER_DEVICE_BASE: u64 = 0x10000000; // 256MB mark
+
+/// Map device MMIO region into user address space
+/// x0 = physical address
+/// x1 = size
+/// Returns: virtual address on success, negative error on failure
+fn sysMapDevice(frame: *SyscallFrame) i64 {
+    const phys = frame.x0;
+    const size = frame.x1;
+
+    // Validate this is an allowed device region
+    var allowed = false;
+    for (ALLOWED_DEVICES) |dev| {
+        if (phys >= dev.phys and phys + size <= dev.phys + dev.size) {
+            allowed = true;
+            break;
+        }
+    }
+
+    if (!allowed) {
+        return @intFromEnum(Error.NO_PERMISSION);
+    }
+
+    // Get current process
+    const thread = scheduler.getCurrent() orelse return @intFromEnum(Error.INVALID_ARGUMENT);
+    const proc = thread.process orelse return @intFromEnum(Error.INVALID_ARGUMENT);
+
+    // Calculate virtual address: USER_DEVICE_BASE + offset from phys base
+    // This creates a predictable mapping
+    const virt = USER_DEVICE_BASE + (phys & 0x0FFFFFFF);
+
+    // Map each page as device memory (uncached)
+    var offset: u64 = 0;
+    while (offset < size) : (offset += mmu.PAGE_SIZE) {
+        const page_phys = phys + offset;
+        const page_virt = virt + offset;
+
+        // Map with device attributes, accessible from EL0
+        const flags = mmu.PTE.VALID | mmu.PTE.PAGE | mmu.PTE.AF |
+            mmu.PTE.ATTR_DEVICE | mmu.PTE.AP_RW_ALL | mmu.PTE.NG | mmu.PTE.PXN | mmu.PTE.UXN;
+
+        if (!proc.address_space.mapRaw(page_virt, page_phys, flags)) {
+            return @intFromEnum(Error.NO_MEMORY);
+        }
+    }
+
+    // Invalidate TLB
+    mmu.invalidateTlbAll();
+
+    return @bitCast(virt);
+}
+
+/// Fixed virtual base for DMA allocations
+const USER_DMA_BASE: u64 = 0x20000000; // 512MB mark
+var dma_alloc_offset: u64 = 0;
+
+/// Allocate DMA-capable memory (physically contiguous, uncached)
+/// x0 = size (will be rounded up to page size)
+/// Returns: virtual address in x0, physical address in x1
+fn sysAllocDma(frame: *SyscallFrame) i64 {
+    const memory = root.memory;
+
+    const size = frame.x0;
+    if (size == 0 or size > 16 * mmu.PAGE_SIZE) { // Max 64KB DMA allocation
+        return @intFromEnum(Error.INVALID_ARGUMENT);
+    }
+
+    // Round up to page size
+    const pages: u32 = @intCast((size + mmu.PAGE_SIZE - 1) / mmu.PAGE_SIZE);
+
+    // Get current process
+    const thread = scheduler.getCurrent() orelse return @intFromEnum(Error.INVALID_ARGUMENT);
+    const proc = thread.process orelse return @intFromEnum(Error.INVALID_ARGUMENT);
+
+    // Allocate physically contiguous pages
+    const phys = memory.allocContiguous(pages) orelse return @intFromEnum(Error.NO_MEMORY);
+
+    // Track memory for cleanup
+    _ = proc.trackMemory(phys, pages);
+
+    // Calculate virtual address
+    const virt = USER_DMA_BASE + dma_alloc_offset;
+    dma_alloc_offset += @as(u64, pages) * mmu.PAGE_SIZE;
+
+    // Map as uncached (device-like) memory for DMA coherency
+    var offset: u64 = 0;
+    while (offset < @as(u64, pages) * mmu.PAGE_SIZE) : (offset += mmu.PAGE_SIZE) {
+        const page_phys = phys + offset;
+        const page_virt = virt + offset;
+
+        // Use non-cacheable normal memory for DMA
+        const flags = mmu.PTE.VALID | mmu.PTE.PAGE | mmu.PTE.AF |
+            mmu.PTE.ATTR_NORMAL_NC | mmu.PTE.AP_RW_ALL | mmu.PTE.NG |
+            mmu.PTE.SH_INNER | mmu.PTE.PXN | mmu.PTE.UXN;
+
+        if (!proc.address_space.mapRaw(page_virt, page_phys, flags)) {
+            // Cleanup on failure
+            memory.freePages(phys, pages);
+            return @intFromEnum(Error.NO_MEMORY);
+        }
+    }
+
+    // Invalidate TLB
+    mmu.invalidateTlbAll();
+
+    // Return virtual in x0, physical in x1
+    frame.x1 = phys;
+    return @bitCast(virt);
+}
+
+/// Get physical address for a virtual address
+/// x0 = virtual address
+/// Returns: physical address, or negative error
+fn sysGetPhys(frame: *SyscallFrame) i64 {
+    const virt = frame.x0;
+
+    // For our simple DMA allocations, we can compute this directly
+    // DMA region: virt = USER_DMA_BASE + offset, phys = allocation_base + offset
+    // But we need to walk page tables for general case
+
+    // Get current process
+    const thread = scheduler.getCurrent() orelse return @intFromEnum(Error.INVALID_ARGUMENT);
+    const proc = thread.process orelse return @intFromEnum(Error.INVALID_ARGUMENT);
+
+    // Walk the page tables to find physical address
+    const l0: *mmu.PageTable = @ptrFromInt(proc.address_space.root);
+
+    const l0_idx = (virt >> 39) & 0x1FF;
+    const l1_idx = (virt >> 30) & 0x1FF;
+    const l2_idx = (virt >> 21) & 0x1FF;
+    const l3_idx = (virt >> 12) & 0x1FF;
+    const page_offset = virt & 0xFFF;
+
+    var entry = l0.entries[l0_idx];
+    if ((entry & mmu.PTE.VALID) == 0) return @intFromEnum(Error.INVALID_ARGUMENT);
+
+    const l1: *mmu.PageTable = @ptrFromInt(entry & mmu.PTE.ADDR_MASK);
+    entry = l1.entries[l1_idx];
+    if ((entry & mmu.PTE.VALID) == 0) return @intFromEnum(Error.INVALID_ARGUMENT);
+
+    const l2: *mmu.PageTable = @ptrFromInt(entry & mmu.PTE.ADDR_MASK);
+    entry = l2.entries[l2_idx];
+    if ((entry & mmu.PTE.VALID) == 0) return @intFromEnum(Error.INVALID_ARGUMENT);
+
+    const l3: *mmu.PageTable = @ptrFromInt(entry & mmu.PTE.ADDR_MASK);
+    entry = l3.entries[l3_idx];
+    if ((entry & mmu.PTE.VALID) == 0) return @intFromEnum(Error.INVALID_ARGUMENT);
+
+    const phys_page = entry & mmu.PTE.ADDR_MASK;
+    return @bitCast(phys_page | page_offset);
 }
 
 /// Debug print (for kernel threads)

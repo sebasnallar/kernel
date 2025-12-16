@@ -85,6 +85,28 @@ pub fn build(b: *std.Build) void {
     const install_console = b.addInstallBinFile(console_mkbin.getOutput(), "console.mlk");
     b.default_step.dependOn(&install_console.step);
 
+    // Build block device driver
+    const blkdev = b.addExecutable(.{
+        .name = "blkdev",
+        .root_source_file = b.path("user/blkdev.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .pic = true,
+    });
+    blkdev.setLinkerScript(b.path("user/user.ld"));
+    blkdev.root_module.stack_protector = false;
+    blkdev.root_module.link_libc = false;
+
+    const blkdev_bin = blkdev.addObjCopy(.{
+        .basename = "blkdev.bin",
+        .format = .bin,
+    });
+
+    const blkdev_mkbin = MkBinStep.create(b, blkdev_bin.getOutput(), "blkdev.mlk");
+    const install_blkdev = b.addInstallBinFile(blkdev_mkbin.getOutput(), "blkdev.mlk");
+    b.default_step.dependOn(&install_blkdev.step);
+
     // ============================================================
     // Kernel
     // ============================================================
@@ -111,9 +133,11 @@ pub fn build(b: *std.Build) void {
     const write_hello = WriteFileStep.create(b, mkbin_step.getOutput(), "src/embedded/hello.mlk");
     const write_init = WriteFileStep.create(b, init_mkbin.getOutput(), "src/embedded/init.mlk");
     const write_console = WriteFileStep.create(b, console_mkbin.getOutput(), "src/embedded/console.mlk");
+    const write_blkdev = WriteFileStep.create(b, blkdev_mkbin.getOutput(), "src/embedded/blkdev.mlk");
     kernel.step.dependOn(&write_hello.step);
     kernel.step.dependOn(&write_init.step);
     kernel.step.dependOn(&write_console.step);
+    kernel.step.dependOn(&write_blkdev.step);
 
     // Install the kernel binary
     b.installArtifact(kernel);

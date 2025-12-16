@@ -15,6 +15,7 @@ const SYS = struct {
 // Binary IDs (must match binaries.zig)
 const BINARY_HELLO: u64 = 0;
 const BINARY_CONSOLE: u64 = 2;
+const BINARY_BLKDEV: u64 = 3;
 
 fn syscall0(num: u64) i64 {
     var ret: i64 = undefined;
@@ -116,7 +117,24 @@ export fn _start() callconv(.C) noreturn {
         yield();
     }
 
-    // Step 2: Spawn multiple application processes (test IPC sender queue)
+    // Step 2: Spawn block device driver
+    write("[init] Spawning block device driver...\n");
+    const blkdev_pid = spawn(BINARY_BLKDEV);
+    if (blkdev_pid > 0) {
+        write("[init] Block device driver started (PID ");
+        putDec(@bitCast(blkdev_pid));
+        write(")\n");
+    } else {
+        write("[init] Failed to spawn block device driver!\n");
+    }
+
+    // Give block driver time to initialize
+    i = 0;
+    while (i < 20) : (i += 1) {
+        yield();
+    }
+
+    // Step 3: Spawn multiple application processes (test IPC sender queue)
     write("[init] Spawning 3 hello processes...\n");
 
     var pids: [3]i64 = undefined;
